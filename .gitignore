@@ -1,0 +1,9 @@
+/target
+.env
+.env.local
+.idea/
+data/
+node_modules/
+*.db
+*.db-shm
+*.db-wal

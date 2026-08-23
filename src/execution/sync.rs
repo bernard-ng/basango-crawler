@@ -1,0 +1,184 @@
+//! Direct crawl and outbox delivery workflows.
+
+use std::time::Duration as StdDuration;
+use std::time::Instant;
+
+use chrono::Duration;
+use tokio::time::{Duration as TokioDuration, interval};
+use uuid::Uuid;
+
+use crate::{
+    articles::{ArticleIngestionClient, DeliveryResult, IngestStatus, Outbox, ingest},
+    domain::{CrawlRequest, SourceId},
+    error::{CrawlError, Result},
+    execution::Runtime,
+    sources::SourceAdapter,
+    telemetry::{RunMetrics, RunReporter},
+};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrawlReport {
+    pub collected: usize,
+    pub stored: usize,
+    pub delivered: usize,
+    pub failed: usize,
+}
+
+/// Run one source from listing discovery through article ingestion.
+pub async fn crawl_now(runtime: &Runtime, mut request: CrawlRequest) -> Result<CrawlReport> {
+    let reporter = RunReporter::new(
+        &runtime.config.ingestion,
+        runtime.http.clone(),
+        request.source_id.as_str(),
+    );
+    let heartbeat_reporter = reporter.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        let mut ticker = interval(TokioDuration::from_secs(15));
+        loop {
+            ticker.tick().await;
+            heartbeat_reporter.heartbeat().await;
+        }
+    });
+    let result = crawl_with_reporter(runtime, &mut request, &reporter).await;
+    heartbeat_task.abort();
+    result
+}
+
+async fn crawl_with_reporter(
+    runtime: &Runtime,
+    request: &mut CrawlRequest,
+    reporter: &RunReporter,
+) -> Result<CrawlReport> {
+    let started_at = Instant::now();
+    reporter.preparing().await;
+    let mut report = CrawlReport::default();
+
+    let outcome: Result<()> = async {
+        let source = runtime.config.source(&request.source_id)?;
+        runtime.resolve_date_range(request).await;
+        let adapter = SourceAdapter::new(source, runtime.http.clone());
+        let outbox = Outbox::open(&runtime.config.sqlite_path(), true)?;
+        let ingestion =
+            ArticleIngestionClient::new(&runtime.config.ingestion, runtime.http.clone())?;
+
+        reporter.started().await;
+        let mut drafts = adapter.stream(request.clone());
+
+        while let Some(item) = drafts.recv().await {
+            let draft = item?;
+            report.collected += 1;
+            match ingest(draft, &outbox, ingestion.as_ref()).await {
+                Ok((_, status)) => {
+                    report.stored += 1;
+                    if matches!(status, IngestStatus::Forwarded | IngestStatus::AlreadyForwarded) {
+                        report.delivered += 1;
+                    }
+                    if status == IngestStatus::DeliveryFailed {
+                        report.failed += 1;
+                    }
+                }
+                Err(error) => {
+                    report.failed += 1;
+                    tracing::error!(%error, source = %request.source_id, "article ingestion failed");
+                }
+            }
+            reporter.progress((&report).into()).await;
+        }
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = outcome {
+        reporter
+            .failed(
+                (&report).into(),
+                elapsed_millis(started_at),
+                error.to_string(),
+            )
+            .await;
+        return Err(error);
+    }
+
+    reporter
+        .completed((&report).into(), elapsed_millis(started_at))
+        .await;
+    Ok(report)
+}
+
+/// Claim and deliver pending/failed outbox rows.
+pub async fn forward_pending(
+    runtime: &Runtime,
+    source_id: Option<&SourceId>,
+    limit: usize,
+) -> Result<CrawlReport> {
+    let outbox_path = runtime.config.sqlite_path();
+    if !Outbox::exists(&outbox_path) {
+        return Err(CrawlError::Configuration(format!(
+            "SQLite outbox does not exist: {}",
+            outbox_path.display()
+        )));
+    }
+    let ingestion = ArticleIngestionClient::new(&runtime.config.ingestion, runtime.http.clone())?
+        .ok_or_else(|| {
+        CrawlError::Configuration(
+            "delivery requires BASANGO_API_CRAWLER_ENDPOINT or ingestion.endpoint".into(),
+        )
+    })?;
+
+    let claim_id = format!("{}:{}", std::process::id(), Uuid::now_v7());
+    let outbox = Outbox::open(&outbox_path, false)?;
+    let articles = outbox.claim(
+        &claim_id,
+        source_id.map(SourceId::as_str),
+        limit,
+        Duration::from_std(StdDuration::from_secs(15 * 60))
+            .expect("15 minutes fits Chrono's duration"),
+    )?;
+    let mut report = CrawlReport {
+        collected: articles.len(),
+        stored: articles.len(),
+        ..CrawlReport::default()
+    };
+
+    for record in articles {
+        match ingestion.deliver(&record.article).await {
+            DeliveryResult::Delivered { .. } => {
+                outbox.mark_forwarded(&record.article.hash)?;
+                report.delivered += 1;
+            }
+            DeliveryResult::Failed {
+                retryable, message, ..
+            } => {
+                outbox.mark_failed(&record.article.hash, &message, retryable)?;
+                report.failed += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
+impl From<&CrawlReport> for RunMetrics {
+    fn from(report: &CrawlReport) -> Self {
+        Self {
+            articles_discovered: report.collected,
+            articles_persisted: report.stored,
+            articles_delivered: report.delivered,
+            articles_failed: report.failed,
+        }
+    }
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_default_starts_at_zero() {
+        assert_eq!(CrawlReport::default().collected, 0);
+    }
+}

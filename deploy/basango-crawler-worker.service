@@ -1,0 +1,19 @@
+# Long-running worker. Systemd restarts it after infrastructure failures.
+[Unit]
+Description=Basango Rust crawler worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crawler
+EnvironmentFile=/opt/crawler/.env
+ExecStart=/opt/crawler/crawler worker --queue discovery --queue articles
+Restart=always
+RestartSec=10
+User=basango
+Group=basango
+StateDirectory=crawler
+
+[Install]
+WantedBy=multi-user.target

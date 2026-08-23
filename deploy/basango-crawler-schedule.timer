@@ -1,0 +1,13 @@
+# Timers provide persistent scheduling without embedding a cron loop in Rust.
+[Unit]
+Description=Run the Basango Rust crawler scheduler periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+RandomizedDelaySec=5min
+Persistent=true
+Unit=crawler-schedule.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,234 @@
+//! Command-line interface and process-level wiring.
+//!
+//! Clap parses untrusted strings at the outermost boundary. Commands then use
+//! typed ranges and options, so deeper modules do not repeatedly validate the
+//! same input.
+
+use std::{env, path::PathBuf};
+
+use anyhow::{Context, bail};
+use clap::{Args, Parser, Subcommand};
+use tracing_subscriber::EnvFilter;
+
+use crate::{
+    Crawler,
+    domain::{CrawlRequest, DateRange, PageRange, SourceId},
+};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "crawler",
+    version,
+    about = "Collect Congolese news from HTML and WordPress sources"
+)]
+struct Cli {
+    /// Override the bundled JSON configuration file.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Crawl one source immediately in this process.
+    #[command(alias = "sync")]
+    Crawl(CrawlArgs),
+    /// Place one or more source discovery jobs in BullMQ.
+    Schedule(ScheduleArgs),
+    /// Process BullMQ discovery and article jobs until interrupted.
+    Worker(WorkerArgs),
+    /// Deliver pending or failed articles from the SQLite outbox.
+    #[command(alias = "push")]
+    Deliver(DeliverArgs),
+    /// Print version information (also available as --version).
+    Version,
+}
+
+#[derive(Debug, Args)]
+struct CrawlArgs {
+    /// Source identifier from the active configuration.
+    #[arg(long)]
+    source_id: SourceId,
+    /// Inclusive page range in start:end form, for example 1:5.
+    #[arg(long, value_parser = parse_page_range)]
+    page_range: Option<PageRange>,
+    /// Inclusive UTC date range, for example 2025-01-01:2025-01-31.
+    #[arg(long, value_parser = parse_date_range)]
+    date_range: Option<DateRange>,
+    /// Optional configured category slug.
+    #[arg(long)]
+    category: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ScheduleArgs {
+    /// Repeat the flag or pass comma-separated IDs.
+    #[arg(long = "source-id", value_delimiter = ',')]
+    source_ids: Vec<SourceId>,
+    /// Inclusive page range in start:end form, for example 1:5.
+    #[arg(long, value_parser = parse_page_range)]
+    page_range: Option<PageRange>,
+    /// Inclusive UTC date range, for example 2025-01-01:2025-01-31.
+    #[arg(long, value_parser = parse_date_range)]
+    date_range: Option<DateRange>,
+    /// Optional configured category slug.
+    #[arg(long)]
+    category: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct WorkerArgs {
+    /// Queue suffix to process; repeat to select both explicitly.
+    #[arg(long, short = 'q')]
+    queue: Vec<String>,
+    /// Maximum number of jobs processed concurrently.
+    #[arg(long)]
+    concurrency: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct DeliverArgs {
+    /// Only claim articles collected from this source.
+    #[arg(long)]
+    source_id: Option<SourceId>,
+    /// Maximum number of outbox rows to claim.
+    #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
+    limit: usize,
+}
+
+pub async fn run() -> anyhow::Result<()> {
+    initialize_logging();
+    let cli = Cli::parse();
+
+    if matches!(cli.command, Command::Version) {
+        println!("crawler {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    let crawler = match cli.config {
+        Some(path) => Crawler::from_config_file(path),
+        None => Crawler::from_environment(),
+    }
+    .context("could not initialize crawler")?;
+
+    match cli.command {
+        Command::Crawl(arguments) => {
+            let report = crawler.crawl(arguments.into()).await?;
+            tracing::info!(?report, "crawl completed");
+        }
+        Command::Schedule(arguments) => {
+            schedule(&crawler, arguments).await?;
+        }
+        Command::Worker(arguments) => {
+            let concurrency = arguments
+                .concurrency
+                .unwrap_or(crawler.config().runtime.worker_concurrency);
+            crawler.work(arguments.queue, concurrency).await?;
+        }
+        Command::Deliver(arguments) => {
+            let report = crawler
+                .deliver_pending(arguments.source_id.as_ref(), arguments.limit)
+                .await?;
+            tracing::info!(?report, "outbox delivery completed");
+            if report.failed > 0 {
+                bail!("failed to deliver {} article(s)", report.failed);
+            }
+        }
+        Command::Version => unreachable!("handled before configuration loading"),
+    }
+    Ok(())
+}
+
+async fn schedule(crawler: &Crawler, arguments: ScheduleArgs) -> anyhow::Result<()> {
+    let source_ids = if arguments.source_ids.is_empty() {
+        env::var("BASANGO_CRAWLER_SOURCE_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::parse)
+            .collect::<Result<Vec<SourceId>, _>>()?
+    } else {
+        arguments.source_ids
+    };
+    if source_ids.is_empty() {
+        bail!("pass --source-id or set BASANGO_CRAWLER_SOURCE_IDS");
+    }
+
+    for source_id in source_ids {
+        let id = crawler
+            .schedule(CrawlRequest {
+                source_id: source_id.clone(),
+                page_range: arguments.page_range,
+                date_range: arguments.date_range,
+                category: arguments.category.clone(),
+            })
+            .await?;
+        tracing::info!(job_id = id, %source_id, "scheduled source discovery");
+    }
+    Ok(())
+}
+
+impl From<CrawlArgs> for CrawlRequest {
+    fn from(value: CrawlArgs) -> Self {
+        Self {
+            source_id: value.source_id,
+            page_range: value.page_range,
+            date_range: value.date_range,
+            category: value.category,
+        }
+    }
+}
+
+fn parse_page_range(value: &str) -> Result<PageRange, String> {
+    PageRange::parse(value).map_err(|error| error.to_string())
+}
+
+fn parse_date_range(value: &str) -> Result<DateRange, String> {
+    DateRange::parse(value).map_err(|error| error.to_string())
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("'{value}' is not a positive integer"))?;
+    if parsed == 0 {
+        return Err("value must be at least 1".into());
+    }
+    Ok(parsed)
+}
+
+fn initialize_logging() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Tests or embedding applications may already have a subscriber. `try_init`
+    // avoids panicking when global logging was initialized elsewhere.
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn clap_parses_typed_crawl_ranges() {
+        let cli = Cli::try_parse_from([
+            "crawler",
+            "crawl",
+            "--source-id",
+            "example",
+            "--page-range",
+            "1:3",
+            "--date-range",
+            "2025-01-01:2025-01-31",
+        ])
+        .unwrap();
+        let Command::Crawl(arguments) = cli.command else {
+            panic!("expected crawl command")
+        };
+        assert_eq!(arguments.page_range.unwrap(), PageRange::new(1, 3).unwrap());
+    }
+}

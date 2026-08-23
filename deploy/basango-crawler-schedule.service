@@ -1,0 +1,14 @@
+# One-shot scheduler. The timer below invokes this unit periodically.
+[Unit]
+Description=Schedule Basango Rust crawler jobs for this node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/crawler
+EnvironmentFile=/opt/crawler/.env
+ExecStart=/opt/crawler/crawler schedule
+User=basango
+Group=basango
+StateDirectory=crawler

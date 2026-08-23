@@ -1,0 +1,235 @@
+{
+  "queue": {
+    "prefix": "basango:crawler",
+    "queues": {
+      "articles": "articles",
+      "discovery": "discovery"
+    },
+    "redis_url": "redis://localhost:6379/0",
+    "retention": {
+      "completed": 3600,
+      "failed": 86400
+    }
+  },
+  "http": {
+    "backoff": {
+      "initial": 1,
+      "max": 30,
+      "multiplier": 2
+    },
+    "max_retries": 3,
+    "rotate": true,
+    "timeout": 20,
+    "user_agent": "Basango/0.1 (+https://basango.ngandu.dev)"
+  },
+  "runtime": {
+    "direction": "forward",
+    "worker_concurrency": 5
+  },
+  "sources": [
+    {
+      "kind": "html",
+      "id": "radiookapi.net",
+      "url": "https://www.radiookapi.net",
+      "fetch_details": true,
+      "pagination_template": "actualite",
+      "selectors": {
+        "body": ".field-name-body",
+        "categories": ".views-field-field-cat-gorie a",
+        "date": "head > meta[property=\"article:published_time\"]",
+        "link": ".views-field-title a",
+        "list": ".view-content > .views-row.content-row",
+        "title": "h1.page-header",
+        "pagination": "ul.pagination > li.pager-last > a"
+      }
+    },
+    {
+      "kind": "html",
+      "id": "7sur7.cd",
+      "url": "https://7sur7.cd",
+      "fetch_details": true,
+      "pagination_template": "index.php/category/{category}",
+      "selectors": {
+        "body": "div[property=\"schema:text\"].field.field--name-body",
+        "date": "head > meta[property=\"article:published_time\"]",
+        "link": ".views-field-title a",
+        "list": ".view-content > .row.views-row",
+        "title": ".views-field-title a",
+        "pagination": "ul.pagination > li.pager__item.pager__item--last > a"
+      }
+    },
+    {
+      "kind": "html",
+      "id": "mediacongo.net",
+      "url": "https://www.mediacongo.net",
+      "date_format": "dd.MM.yyyy",
+      "fetch_details": true,
+      "pagination_template": "articles.html",
+      "selectors": {
+        "body": ".article_ttext",
+        "categories": "a.color_link",
+        "date": ".article_other_about",
+        "link": "a:first-child",
+        "list": ".for_aitems > .article_other_item",
+        "title": "h1",
+        "pagination": "div.pagination > div > a:last-child"
+      }
+    },
+    {
+      "kind": "html",
+      "id": "actualite.cd",
+      "url": "https://actualite.cd",
+      "fetch_details": true,
+      "pagination_template": "actualite",
+      "selectors": {
+        "body": ".views-field.views-field-body .field-content",
+        "categories": "#actu-cat",
+        "date": "head > meta[property=\"article:published_time\"]",
+        "link": "#actu-titre a",
+        "list": "#views-bootstrap-taxonomy-term-page-2 > div > div",
+        "title": "h1.page-title"
+      }
+    },
+    {
+      "kind": "wordpress",
+      "id": "beto.cd",
+      "url": "https://beto.cd",
+      "rate_limit": true
+    },
+    {
+      "kind": "wordpress",
+      "id": "newscd.net",
+      "url": "https://newscd.net"
+    },
+    {
+      "kind": "wordpress",
+      "id": "africanewsrdc.net",
+      "url": "https://www.africanewsrdc.net"
+    },
+    {
+      "kind": "wordpress",
+      "id": "angazainstitute.ac.cd",
+      "url": "https://angazainstitute.ac.cd"
+    },
+    {
+      "kind": "wordpress",
+      "id": "b-onetv.cd",
+      "url": "https://b-onetv.cd"
+    },
+    {
+      "kind": "wordpress",
+      "id": "bukavufm.com",
+      "url": "https://bukavufm.com"
+    },
+    {
+      "kind": "wordpress",
+      "id": "changement7.net",
+      "url": "https://changement7.net"
+    },
+    {
+      "kind": "wordpress",
+      "id": "congoactu.net",
+      "url": "https://congoactu.net"
+    },
+    {
+      "kind": "wordpress",
+      "id": "congoindependant.com",
+      "url": "https://www.congoindependant.com"
+    },
+    {
+      "kind": "wordpress",
+      "id": "congoquotidien.com",
+      "url": "https://www.congoquotidien.com"
+    },
+    {
+      "kind": "wordpress",
+      "id": "cumulard.cd",
+      "url": "https://www.cumulard.cd"
+    },
+    {
+      "kind": "wordpress",
+      "id": "environews-rdc.net",
+      "url": "https://environews-rdc.net"
+    },
+    {
+      "kind": "wordpress",
+      "id": "freemediardc.info",
+      "url": "https://www.freemediardc.info"
+    },
+    {
+      "kind": "wordpress",
+      "id": "geopolismagazine.org",
+      "url": "https://geopolismagazine.org"
+    },
+    {
+      "kind": "wordpress",
+      "id": "habarirdc.net",
+      "url": "https://habarirdc.net"
+    },
+    {
+      "kind": "wordpress",
+      "id": "infordc.com",
+      "url": "https://infordc.com"
+    },
+    {
+      "kind": "wordpress",
+      "id": "kilalopress.net",
+      "url": "https://kilalopress.net"
+    },
+    {
+      "kind": "wordpress",
+      "id": "laprosperiteonline.net",
+      "url": "https://laprosperiteonline.net"
+    },
+    {
+      "kind": "wordpress",
+      "id": "laprunellerdc.cd",
+      "url": "https://laprunellerdc.cd"
+    },
+    {
+      "kind": "wordpress",
+      "id": "lesmedias.net",
+      "url": "https://lesmedias.net"
+    },
+    {
+      "kind": "wordpress",
+      "id": "lesvolcansnews.net",
+      "url": "https://lesvolcansnews.net"
+    },
+    {
+      "kind": "wordpress",
+      "id": "netic-news.net",
+      "url": "https://www.netic-news.net"
+    },
+    {
+      "kind": "wordpress",
+      "id": "objectif-infos.cd",
+      "url": "https://objectif-infos.cd"
+    },
+    {
+      "kind": "wordpress",
+      "id": "scooprdc.net",
+      "url": "https://scooprdc.net"
+    },
+    {
+      "kind": "wordpress",
+      "id": "journaldekinshasa.com",
+      "url": "https://www.journaldekinshasa.com"
+    },
+    {
+      "kind": "wordpress",
+      "id": "lepotentiel.cd",
+      "url": "https://lepotentiel.cd"
+    },
+    {
+      "kind": "wordpress",
+      "id": "acturdc.com",
+      "url": "https://acturdc.com"
+    },
+    {
+      "kind": "wordpress",
+      "id": "matininfos.net",
+      "url": "https://matininfos.net"
+    }
+  ]
+}

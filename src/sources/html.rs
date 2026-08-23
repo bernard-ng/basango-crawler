@@ -1,0 +1,383 @@
+//! Generic CSS-selector-driven HTML crawler.
+
+use std::{collections::HashSet, time::Duration};
+
+use regex::Regex;
+use scraper::{ElementRef, Html, Selector};
+use tokio::sync::mpsc;
+use tokio::time::sleep;
+use url::Url;
+
+use crate::{
+    config::HtmlSourceConfig,
+    domain::{ArticleDraft, CrawlRequest, PageRange},
+    error::{CrawlError, Result},
+    http::{HttpClient, consume_open_graph_html},
+    sources::{ArticleSeed, common},
+};
+
+pub struct HtmlCrawler {
+    source: HtmlSourceConfig,
+    http: HttpClient,
+}
+
+impl HtmlCrawler {
+    pub fn new(source: HtmlSourceConfig, http: HttpClient) -> Self {
+        Self { source, http }
+    }
+
+    /// Crawl listings and detail pages directly in one process.
+    pub async fn crawl_into(
+        &self,
+        request: &CrawlRequest,
+        sender: &mpsc::Sender<Result<ArticleDraft>>,
+    ) -> Result<()> {
+        let page_range = match request.page_range {
+            Some(range) => range,
+            None => self.pagination(request.category.as_deref()).await?,
+        };
+
+        for page in page_range.start..=page_range.end {
+            let endpoint = self.endpoint_url(page, request.category.as_deref())?;
+            let listing = match self.fetch_text(&endpoint).await {
+                Ok(listing) => listing,
+                Err(error) => {
+                    tracing::error!(%error, %endpoint, page, "failed to fetch HTML listing");
+                    continue;
+                }
+            };
+            let entries = self.listing_entries(&listing)?;
+            if entries.is_empty() {
+                tracing::warn!(page, %endpoint, "HTML listing contained no matching articles");
+            }
+
+            for entry in entries {
+                let Some(link) = self.extract_link(&entry)? else {
+                    tracing::warn!(page, "skipping HTML listing entry without a link");
+                    continue;
+                };
+                let html = if self.source.fetch_details {
+                    match self.fetch_text(&link).await {
+                        Ok(html) => html,
+                        Err(error) => {
+                            tracing::error!(%error, %link, "failed to fetch HTML detail page");
+                            continue;
+                        }
+                    }
+                } else {
+                    entry.html
+                };
+
+                match self.parse_article(&html, Some(&link), request.category.as_deref()) {
+                    Ok(draft) => {
+                        if let Some(range) = request.date_range {
+                            if range.is_older_than_range(draft.published_at) {
+                                // Listings are newest-first. This is a control
+                                // signal, not a failure, so return collected data.
+                                return Ok(());
+                            }
+                            if !range.contains(draft.published_at) {
+                                continue;
+                            }
+                        }
+                        if sender.send(Ok(draft)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(error) => tracing::error!(%error, %link, "failed to parse HTML article"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Discover detail URLs for the Redis-backed execution mode.
+    pub async fn discover(&self, request: &CrawlRequest) -> Result<Vec<ArticleSeed>> {
+        let page_range = match request.page_range {
+            Some(range) => range,
+            None => self.pagination(request.category.as_deref()).await?,
+        };
+        let mut locations = Vec::new();
+        let mut seen = HashSet::new();
+
+        for page in page_range.start..=page_range.end {
+            let endpoint = self.endpoint_url(page, request.category.as_deref())?;
+            let listing = self.fetch_text(&endpoint).await?;
+            for entry in self.listing_entries(&listing)? {
+                if let Some(url) = self.extract_link(&entry)?
+                    && seen.insert(url.clone())
+                {
+                    locations.push(ArticleSeed { url, data: None });
+                }
+            }
+        }
+        Ok(locations)
+    }
+
+    pub async fn collect(&self, url: &Url, request: &CrawlRequest) -> Result<ArticleDraft> {
+        let html = self.fetch_text(url).await?;
+        let draft = self.parse_article(&html, Some(url), request.category.as_deref())?;
+        if request
+            .date_range
+            .is_some_and(|range| !range.contains(draft.published_at))
+        {
+            return Err(CrawlError::ArticleOutOfDateRange {
+                url: url.to_string(),
+            });
+        }
+        Ok(draft)
+    }
+
+    pub fn endpoint_url(&self, page: u32, category: Option<&str>) -> Result<Url> {
+        let mut template = self.source.pagination_template.clone();
+        template = template.replace("{category}", category.unwrap_or_default());
+        if template.contains("{page}") {
+            template = template.replace("{page}", &page.to_string());
+        }
+
+        let mut url =
+            common::absolute_url(&self.source.common.url, &template).ok_or_else(|| {
+                CrawlError::Configuration(format!("invalid pagination template '{template}'"))
+            })?;
+        if !self.source.pagination_template.contains("{page}") && page > 0 {
+            url.query_pairs_mut().append_pair("page", &page.to_string());
+        }
+        Ok(url)
+    }
+
+    async fn pagination(&self, category: Option<&str>) -> Result<PageRange> {
+        let fallback = PageRange::new(0, 1)?;
+        let url = self.endpoint_url(0, category)?;
+        let Ok(html) = self.fetch_text(&url).await else {
+            return Ok(fallback);
+        };
+        let document = Html::parse_document(&html);
+        let selector = parse_selector(&self.source.selectors.pagination)?;
+        let Some(href) = document
+            .select(&selector)
+            .filter_map(|element| element.value().attr("href"))
+            .next_back()
+        else {
+            return Ok(fallback);
+        };
+
+        let absolute = common::absolute_url(&self.source.common.url, href);
+        let page = absolute
+            .as_ref()
+            .and_then(|url| url.query_pairs().find(|(key, _)| key == "page"))
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .or_else(|| {
+                Regex::new(r"(?:page[=/]|[?&]page=)(\d+)")
+                    .expect("static regex is valid")
+                    .captures(href)
+                    .and_then(|captures| captures.get(1))
+                    .and_then(|value| value.as_str().parse().ok())
+            })
+            .unwrap_or(1);
+        PageRange::new(0, page.max(1))
+    }
+
+    fn listing_entries(&self, html: &str) -> Result<Vec<ListingEntry>> {
+        let document = Html::parse_document(html);
+        let selector = parse_selector(&self.source.selectors.list)?;
+        Ok(document
+            .select(&selector)
+            .map(|element| ListingEntry {
+                html: element.html(),
+            })
+            .collect())
+    }
+
+    fn extract_link(&self, entry: &ListingEntry) -> Result<Option<Url>> {
+        let fragment = Html::parse_fragment(&entry.html);
+        let selector = parse_selector(&self.source.selectors.link)?;
+        let value = fragment.select(&selector).next().and_then(|element| {
+            element
+                .value()
+                .attr("href")
+                .or_else(|| element.value().attr("data-href"))
+                .or_else(|| element.value().attr("src"))
+        });
+        Ok(value.and_then(|value| common::absolute_url(&self.source.common.url, value)))
+    }
+
+    fn parse_article(
+        &self,
+        html: &str,
+        known_url: Option<&Url>,
+        selected_category: Option<&str>,
+    ) -> Result<ArticleDraft> {
+        let document = Html::parse_document(html);
+        let title = extract_text(&document, &self.source.selectors.title)?
+            .ok_or_else(|| CrawlError::InvalidArticle("missing article title".into()))?;
+        let link = known_url
+            .cloned()
+            .or_else(|| {
+                extract_attribute(&document, &self.source.selectors.link)
+                    .ok()
+                    .flatten()
+                    .and_then(|value| common::absolute_url(&self.source.common.url, &value))
+            })
+            .ok_or_else(|| CrawlError::InvalidArticle("missing article link".into()))?;
+        let raw_date = extract_text(&document, &self.source.selectors.date)?
+            .ok_or_else(|| CrawlError::InvalidArticle("missing article date".into()))?;
+        let published_at = common::parse_published_at(&raw_date, &self.source.common.date_format)
+            .ok_or_else(|| {
+            CrawlError::InvalidArticle(format!("cannot parse article date '{raw_date}'"))
+        })?;
+
+        let body_selector = parse_selector(&self.source.selectors.body)?;
+        let parts: Vec<String> = document
+            .select(&body_selector)
+            .map(|node| html2md::parse_html(&node.html()))
+            .filter(|part| !part.trim().is_empty())
+            .collect();
+        let body = if parts.is_empty() {
+            html2md::parse_html(html)
+        } else {
+            parts.join("\n")
+        };
+
+        let categories = self.extract_categories(&document, selected_category)?;
+        let metadata = consume_open_graph_html(html, &link);
+        Ok(ArticleDraft {
+            title,
+            body,
+            link,
+            source_id: self.source.common.id.clone(),
+            categories,
+            metadata,
+            published_at,
+        })
+    }
+
+    fn extract_categories(&self, document: &Html, fallback: Option<&str>) -> Result<Vec<String>> {
+        let Some(selector) = &self.source.selectors.categories else {
+            return Ok(fallback
+                .map(|category| vec![category.to_lowercase()])
+                .unwrap_or_default());
+        };
+        let selector = parse_selector(selector)?;
+        let mut seen = HashSet::new();
+        Ok(document
+            .select(&selector)
+            .filter_map(element_text)
+            .map(|value| value.to_lowercase())
+            .filter(|value| seen.insert(value.clone()))
+            .collect())
+    }
+
+    async fn fetch_text(&self, url: &Url) -> Result<String> {
+        if self.source.common.rate_limit {
+            // The original config only carries a boolean. One second is a
+            // conservative default until a per-source duration is introduced.
+            sleep(Duration::from_secs(1)).await;
+        }
+        self.http.get(url).await?.require_success()?.text()
+    }
+}
+
+struct ListingEntry {
+    html: String,
+}
+
+fn parse_selector(value: &str) -> Result<Selector> {
+    Selector::parse(value).map_err(|error| {
+        CrawlError::InvalidSourceSelectors(format!("selector '{value}' is invalid: {error}"))
+    })
+}
+
+fn extract_text(document: &Html, selector: &str) -> Result<Option<String>> {
+    let selector = parse_selector(selector)?;
+    Ok(document.select(&selector).next().and_then(|element| {
+        let name = element.value().name();
+        let special = match name {
+            "img" => element
+                .value()
+                .attr("alt")
+                .or_else(|| element.value().attr("title")),
+            "time" => element.value().attr("datetime"),
+            "meta" => element.value().attr("content"),
+            _ => None,
+        };
+        special
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| element_text(element))
+    }))
+}
+
+fn extract_attribute(document: &Html, selector: &str) -> Result<Option<String>> {
+    let selector = parse_selector(selector)?;
+    Ok(document.select(&selector).next().and_then(|element| {
+        element
+            .value()
+            .attr("href")
+            .or_else(|| element.value().attr("data-href"))
+            .or_else(|| element.value().attr("src"))
+            .map(str::to_owned)
+    }))
+}
+
+fn element_text(element: ElementRef<'_>) -> Option<String> {
+    let value = element.text().collect::<Vec<_>>().join(" ");
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!value.is_empty()).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::{CommonSourceConfig, HtmlSelectors};
+
+    use super::*;
+
+    fn source() -> HtmlSourceConfig {
+        HtmlSourceConfig {
+            common: CommonSourceConfig {
+                id: crate::domain::SourceId::new("example").unwrap(),
+                url: Url::parse("https://example.com").unwrap(),
+                ..CommonSourceConfig::default()
+            },
+            fetch_details: false,
+            pagination_template: "news/{page}".into(),
+            selectors: HtmlSelectors {
+                body: ".body".into(),
+                categories: Some(".category".into()),
+                date: "time".into(),
+                link: "a".into(),
+                list: ".article".into(),
+                title: "h1".into(),
+                pagination: ".pages a".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn parses_an_html_article_without_network_access() {
+        let http = HttpClient::new(&Default::default()).unwrap();
+        let crawler = HtmlCrawler::new(source(), http);
+        let html = r#"
+            <html><head><meta property="og:title" content="Metadata title"></head>
+            <body><h1>Article title</h1><time datetime="2025-02-01T12:00:00Z"></time>
+            <div class="body"><p>Hello <strong>world</strong></p></div>
+            <span class="category">Politics</span></body></html>
+        "#;
+        let url = Url::parse("https://example.com/story").unwrap();
+        let article = crawler.parse_article(html, Some(&url), None).unwrap();
+        assert_eq!(article.title, "Article title");
+        assert!(article.body.contains("Hello"));
+        assert_eq!(article.categories, vec!["politics"]);
+    }
+
+    #[test]
+    fn substitutes_category_and_page_in_endpoint() {
+        let mut source = source();
+        source.pagination_template = "category/{category}/page/{page}".into();
+        let crawler = HtmlCrawler::new(source, HttpClient::new(&Default::default()).unwrap());
+        assert_eq!(
+            crawler.endpoint_url(3, Some("news")).unwrap().as_str(),
+            "https://example.com/category/news/page/3"
+        );
+    }
+}
