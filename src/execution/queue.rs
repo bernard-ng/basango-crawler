@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::QueueConfig,
-    domain::CrawlRequest,
+    domain::{CrawlRequest, SourceId},
     error::{CrawlError, Result},
     sources::ArticleSeed,
     telemetry::RunMetrics,
@@ -49,6 +49,13 @@ pub struct FetchJob {
 pub struct QueuedRunUpdate {
     pub metrics: RunMetrics,
     pub terminal: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenQueuedRun {
+    pub run: QueuedRunContext,
+    pub source_id: SourceId,
+    pub metrics: RunMetrics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,17 +167,42 @@ impl JobQueue {
         Ok(queued.id().to_owned())
     }
 
-    pub async fn initialize_run(&self, run_id: &str, discovered: usize) -> Result<()> {
+    pub async fn prepare_run(&self, run: &QueuedRunContext, source_id: &SourceId) -> Result<()> {
         const SCRIPT: &str = r#"
             if redis.call('EXISTS', KEYS[1]) == 0 then
                 redis.call('HSET', KEYS[1],
-                    'discovered', ARGV[1],
+                    'sourceId', ARGV[1],
+                    'startedAt', ARGV[2],
+                    'discovered', 0,
                     'processed', 0,
                     'persisted', 0,
                     'delivered', 0,
                     'failed', 0,
                     'terminalSent', 0)
             end
+            redis.call('EXPIRE', KEYS[1], ARGV[3])
+            return 1
+        "#;
+        let key = self.run_progress_key(&run.run_id);
+        let mut connection = self
+            .progress_client
+            .get_multiplexed_async_connection()
+            .await?;
+        redis::Script::new(SCRIPT)
+            .key(key)
+            .arg(source_id.as_str())
+            .arg(run.started_at.to_rfc3339())
+            .arg(RUN_PROGRESS_TTL_SECONDS)
+            .invoke_async::<i64>(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn initialize_run(&self, run_id: &str, discovered: usize) -> Result<bool> {
+        const SCRIPT: &str = r#"
+            if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+            if tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 1 then return 0 end
+            redis.call('HSET', KEYS[1], 'discovered', ARGV[1])
             redis.call('EXPIRE', KEYS[1], ARGV[2])
             return 1
         "#;
@@ -179,13 +211,31 @@ impl JobQueue {
             .progress_client
             .get_multiplexed_async_connection()
             .await?;
-        redis::Script::new(SCRIPT)
+        let initialized: i64 = redis::Script::new(SCRIPT)
             .key(key)
             .arg(discovered)
             .arg(RUN_PROGRESS_TTL_SECONDS)
-            .invoke_async::<i64>(&mut connection)
+            .invoke_async(&mut connection)
             .await?;
-        Ok(())
+        Ok(initialized == 1)
+    }
+
+    pub async fn run_is_open(&self, run_id: &str) -> Result<bool> {
+        const SCRIPT: &str = r#"
+            if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+            if tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 1 then return 0 end
+            return 1
+        "#;
+        let key = self.run_progress_key(run_id);
+        let mut connection = self
+            .progress_client
+            .get_multiplexed_async_connection()
+            .await?;
+        let open: i64 = redis::Script::new(SCRIPT)
+            .key(key)
+            .invoke_async(&mut connection)
+            .await?;
+        Ok(open == 1)
     }
 
     pub async fn record_run_result(
@@ -275,6 +325,97 @@ impl JobQueue {
         }))
     }
 
+    pub async fn complete_run(&self, run_id: &str) -> Result<Option<RunMetrics>> {
+        self.close_run(run_id).await
+    }
+
+    pub async fn complete_open_runs(&self) -> Result<Vec<OpenQueuedRun>> {
+        const SCRIPT: &str = r#"
+            if redis.call('EXISTS', KEYS[1]) == 0 then return {} end
+            if tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 1 then return {} end
+            redis.call('HSET', KEYS[1], 'terminalSent', 1)
+            redis.call('EXPIRE', KEYS[1], ARGV[1])
+            return {
+                redis.call('HGET', KEYS[1], 'sourceId') or '',
+                redis.call('HGET', KEYS[1], 'startedAt') or '',
+                tostring(tonumber(redis.call('HGET', KEYS[1], 'discovered')) or 0),
+                tostring(tonumber(redis.call('HGET', KEYS[1], 'persisted')) or 0),
+                tostring(tonumber(redis.call('HGET', KEYS[1], 'delivered')) or 0),
+                tostring(tonumber(redis.call('HGET', KEYS[1], 'failed')) or 0)
+            }
+        "#;
+        let pattern = self.run_progress_pattern();
+        let mut connection = self
+            .progress_client
+            .get_multiplexed_async_connection()
+            .await?;
+        let mut cursor = 0_u64;
+        let mut runs = Vec::new();
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut connection)
+                .await?;
+            for key in keys {
+                let values: Vec<String> = redis::Script::new(SCRIPT)
+                    .key(&key)
+                    .arg(RUN_PROGRESS_TTL_SECONDS)
+                    .invoke_async(&mut connection)
+                    .await?;
+                if values.len() != 6 {
+                    continue;
+                }
+                let Some(run_id) = key.rsplit(':').next() else {
+                    continue;
+                };
+                let Ok(source_id) = SourceId::new(&values[0]) else {
+                    tracing::warn!(run_id, "skipping queued run tracker without a source ID");
+                    continue;
+                };
+                let Ok(started_at) = DateTime::parse_from_rfc3339(&values[1]) else {
+                    tracing::warn!(
+                        run_id,
+                        "skipping queued run tracker with an invalid start time"
+                    );
+                    continue;
+                };
+                let metrics = [
+                    parse_metric(&values[2]),
+                    parse_metric(&values[3]),
+                    parse_metric(&values[4]),
+                    parse_metric(&values[5]),
+                ];
+                let [Ok(discovered), Ok(persisted), Ok(delivered), Ok(failed)] = metrics else {
+                    tracing::warn!(run_id, "skipping queued run tracker with invalid metrics");
+                    continue;
+                };
+                runs.push(OpenQueuedRun {
+                    run: QueuedRunContext {
+                        run_id: run_id.to_owned(),
+                        agent_id: self.agent_id.clone(),
+                        started_at: started_at.with_timezone(&Utc),
+                    },
+                    source_id,
+                    metrics: RunMetrics {
+                        articles_discovered: discovered,
+                        articles_persisted: persisted,
+                        articles_delivered: delivered,
+                        articles_failed: failed,
+                    },
+                });
+            }
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
+        }
+        Ok(runs)
+    }
+
     pub async fn reset_agent(&self, include_legacy_queues: bool) -> Result<AgentResetReport> {
         self.discovery.obliterate(true, 1_000).await?;
         self.articles.obliterate(true, 1_000).await?;
@@ -290,10 +431,7 @@ impl JobQueue {
             )?;
         }
 
-        let pattern = format!(
-            "{}:telemetry:{}:run:*",
-            self.config.prefix, self.agent_scope
-        );
+        let pattern = self.run_progress_pattern();
         let mut connection = self
             .progress_client
             .get_multiplexed_async_connection()
@@ -336,6 +474,47 @@ impl JobQueue {
             "{}:telemetry:{}:run:{run_id}",
             self.config.prefix, self.agent_scope
         )
+    }
+
+    fn run_progress_pattern(&self) -> String {
+        format!(
+            "{}:telemetry:{}:run:*",
+            self.config.prefix, self.agent_scope
+        )
+    }
+
+    async fn close_run(&self, run_id: &str) -> Result<Option<RunMetrics>> {
+        const SCRIPT: &str = r#"
+            if redis.call('EXISTS', KEYS[1]) == 0 then return {} end
+            if tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 1 then return {} end
+            redis.call('HSET', KEYS[1], 'terminalSent', 1)
+            redis.call('EXPIRE', KEYS[1], ARGV[1])
+            return {
+                tonumber(redis.call('HGET', KEYS[1], 'discovered')) or 0,
+                tonumber(redis.call('HGET', KEYS[1], 'persisted')) or 0,
+                tonumber(redis.call('HGET', KEYS[1], 'delivered')) or 0,
+                tonumber(redis.call('HGET', KEYS[1], 'failed')) or 0
+            }
+        "#;
+        let key = self.run_progress_key(run_id);
+        let mut connection = self
+            .progress_client
+            .get_multiplexed_async_connection()
+            .await?;
+        let values: Vec<i64> = redis::Script::new(SCRIPT)
+            .key(key)
+            .arg(RUN_PROGRESS_TTL_SECONDS)
+            .invoke_async(&mut connection)
+            .await?;
+        if values.len() != 4 {
+            return Ok(None);
+        }
+        Ok(Some(RunMetrics {
+            articles_discovered: values[0].max(0) as usize,
+            articles_persisted: values[1].max(0) as usize,
+            articles_delivered: values[2].max(0) as usize,
+            articles_failed: values[3].max(0) as usize,
+        }))
     }
 }
 
@@ -388,6 +567,14 @@ fn encode_agent_id(agent_id: &str) -> String {
 
 fn scoped_queue_name(agent_scope: &str, queue_name: &str) -> String {
     format!("{agent_scope}-{queue_name}")
+}
+
+fn parse_metric(value: &str) -> Result<usize> {
+    value.parse::<usize>().map_err(|_| {
+        CrawlError::Queue(format!(
+            "invalid queued run metric '{value}' in Redis progress tracker"
+        ))
+    })
 }
 
 #[cfg(test)]

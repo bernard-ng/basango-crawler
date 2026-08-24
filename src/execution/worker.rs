@@ -82,8 +82,28 @@ pub async fn run_worker(
     tokio::signal::ctrl_c().await.map_err(CrawlError::Io)?;
     heartbeat_task.abort();
     tracing::info!("shutdown requested; draining BullMQ workers");
+    let mut close_error = None;
     for worker in &workers {
-        worker.close(30_000).await?;
+        if let Err(error) = worker.close(30_000).await {
+            tracing::warn!(%error, "BullMQ worker did not drain cleanly");
+            close_error = Some(error);
+        }
+    }
+    let open_runs = jobs.complete_open_runs().await?;
+    for open_run in &open_runs {
+        queued_run_reporter(&runtime, &open_run.run, &open_run.source_id)
+            .completed(
+                open_run.metrics,
+                queued_duration_ms(open_run.run.started_at),
+            )
+            .await;
+    }
+    tracing::info!(
+        runs_completed = open_runs.len(),
+        "worker shutdown completed open queued runs"
+    );
+    if let Some(error) = close_error {
+        return Err(error.into());
     }
     Ok(())
 }
@@ -118,6 +138,17 @@ async fn process_job(
         "discover-source" => {
             let final_attempt = job.attempts_made() + 1 >= job.opts().attempts.unwrap_or(1);
             let payload: DiscoverJob = serde_json::from_value(job.data().clone())?;
+            if !jobs
+                .run_is_open(&payload.run.run_id)
+                .await
+                .map_err(processing_error)?
+            {
+                tracing::info!(
+                    run_id = payload.run.run_id,
+                    "skipping discovery job for a completed run"
+                );
+                return Ok(json!({ "articlesQueued": 0 }));
+            }
             process_discovery(runtime, jobs, payload, final_attempt)
                 .await
                 .map(|count| json!({ "articlesQueued": count }))
@@ -127,6 +158,18 @@ async fn process_job(
             let job_id = job.id().to_owned();
             let final_attempt = job.attempts_made() + 1 >= job.opts().attempts.unwrap_or(1);
             let payload: FetchJob = serde_json::from_value(job.data().clone())?;
+            if !jobs
+                .run_is_open(&payload.run.run_id)
+                .await
+                .map_err(processing_error)?
+            {
+                tracing::info!(
+                    run_id = payload.run.run_id,
+                    url = %payload.article.url,
+                    "skipping article job for a completed run"
+                );
+                return Ok(Value::Null);
+            }
             match process_article(runtime, outbox, ingestion, &payload).await {
                 Ok(outcome) => {
                     report_article_result(runtime, jobs, &payload, &job_id, outcome).await?;
@@ -171,15 +214,24 @@ async fn process_discovery(
         let mut adapter = SourceAdapter::new(source, runtime.http.clone());
         let articles = adapter.discover(&request).await?;
         let count = articles.len();
-        jobs.initialize_run(&payload.run.run_id, count).await?;
+        if !jobs.initialize_run(&payload.run.run_id, count).await? {
+            tracing::info!(
+                run_id = payload.run.run_id,
+                source = %request.source_id,
+                "queued run was already completed; skipping discovered articles"
+            );
+            return Ok(0);
+        }
         let discovered = RunMetrics {
             articles_discovered: count,
             ..RunMetrics::default()
         };
         if count == 0 {
-            reporter
-                .completed(discovered, queued_duration_ms(payload.run.started_at))
-                .await;
+            if let Some(metrics) = jobs.complete_run(&payload.run.run_id).await? {
+                reporter
+                    .completed(metrics, queued_duration_ms(payload.run.started_at))
+                    .await;
+            }
             return Ok(0);
         }
         reporter.progress(discovered).await;

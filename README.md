@@ -166,7 +166,7 @@ cargo run -- worker --concurrency 5
 cargo run -- worker --queue discovery --queue articles --concurrency 5
 ```
 
-Workers publish an agent heartbeat every 15 seconds. Stop them gracefully with `Ctrl-C`.
+Workers publish an agent heartbeat every 15 seconds. Stop them gracefully with `Ctrl-C`; active jobs are drained, every remaining open run is reported as completed with its latest partial metrics, and leftover jobs from those completed runs are skipped after restart.
 
 ### Resetting one agent
 

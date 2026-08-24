@@ -72,16 +72,26 @@ impl Crawler {
             started_at: chrono::Utc::now(),
         };
         reporter.preparing().await;
-        let result = async {
-            JobQueue::connect(&self.runtime.config.queue, &self.runtime.agent_id)
-                .await?
-                .enqueue_discovery(DiscoverJob { request, run })
-                .await
+        let queue =
+            match JobQueue::connect(&self.runtime.config.queue, &self.runtime.agent_id).await {
+                Ok(queue) => queue,
+                Err(error) => {
+                    reporter
+                        .failed(RunMetrics::default(), 0, error.to_string())
+                        .await;
+                    return Err(error);
+                }
+            };
+        if let Err(error) = queue.prepare_run(&run, &request.source_id).await {
+            reporter
+                .failed(RunMetrics::default(), 0, error.to_string())
+                .await;
+            return Err(error);
         }
-        .await;
-        match result {
+        match queue.enqueue_discovery(DiscoverJob { request, run }).await {
             Ok(job_id) => Ok(job_id),
             Err(error) => {
+                let _ = queue.fail_run(reporter.run_id()).await;
                 reporter
                     .failed(RunMetrics::default(), 0, error.to_string())
                     .await;
