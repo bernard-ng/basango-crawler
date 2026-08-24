@@ -29,9 +29,13 @@ pub(crate) fn parse_published_at(raw: &str, configured_format: &str) -> Option<D
         "yyyy-LL-dd" => "%Y-%m-%d",
         "yyyy-LL-dd HH:mm" => "%Y-%m-%d %H:%M",
         "yyyy-LL-dd'T'HH:mm:ss" => "%Y-%m-%dT%H:%M:%S",
+        "yyyy-LL-dd'T'HH:mm:ssxx" => "%Y-%m-%dT%H:%M:%S%z",
         other => other,
     };
 
+    if let Ok(value) = DateTime::parse_from_str(value, chrono_format) {
+        return Some(value.with_timezone(&Utc));
+    }
     if let Ok(value) = NaiveDateTime::parse_from_str(value, chrono_format) {
         // A source-local timezone is not always provided. Treating naive values
         // as UTC is deterministic; offset-bearing values above retain offsets.
@@ -54,4 +58,17 @@ pub(crate) fn text_from_html(html: &str) -> Option<String> {
     let text = fragment.root_element().text().collect::<Vec<_>>().join(" ");
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     (!text.is_empty()).then_some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_offset_without_colon_using_configured_format() {
+        let published_at =
+            parse_published_at("2026-08-03T21:00:54+0100", "yyyy-LL-dd'T'HH:mm:ssxx").unwrap();
+
+        assert_eq!(published_at.to_rfc3339(), "2026-08-03T20:00:54+00:00");
+    }
 }

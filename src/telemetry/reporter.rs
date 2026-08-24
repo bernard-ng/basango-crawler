@@ -19,14 +19,25 @@ pub struct AgentReporter {
 }
 
 impl AgentReporter {
-    pub fn new(config: &IngestionApiConfig, client: HttpClient) -> Self {
-        Self {
-            publisher: SignalPublisher::new(config, client),
-        }
+    pub fn new(config: &IngestionApiConfig, client: HttpClient, agent_id: &str) -> Self {
+        let mut publisher = SignalPublisher::new(config, client);
+        publisher.agent_id = agent_id.to_owned();
+        Self { publisher }
     }
 
     pub async fn heartbeat(&self) {
         self.publisher.heartbeat().await;
+    }
+
+    pub async fn reset(&self) {
+        self.publisher
+            .publish(IngestionSignal::AgentReset {
+                signal_id: signal_id(),
+                agent_id: self.publisher.agent_id.clone(),
+                emitted_at: Utc::now(),
+                version: self.publisher.version.clone(),
+            })
+            .await;
     }
 }
 
@@ -42,12 +53,43 @@ pub struct RunReporter {
 }
 
 impl RunReporter {
-    pub fn new(config: &IngestionApiConfig, client: HttpClient, source_id: &str) -> Self {
+    pub fn new(
+        config: &IngestionApiConfig,
+        client: HttpClient,
+        source_id: &str,
+        agent_id: &str,
+    ) -> Self {
+        Self::with_context(
+            config,
+            client,
+            Uuid::now_v7().to_string(),
+            agent_id.to_owned(),
+            source_id.to_owned(),
+        )
+    }
+
+    pub fn with_context(
+        config: &IngestionApiConfig,
+        client: HttpClient,
+        run_id: String,
+        agent_id: String,
+        source_id: String,
+    ) -> Self {
+        let mut publisher = SignalPublisher::new(config, client);
+        publisher.agent_id = agent_id;
         Self {
-            publisher: SignalPublisher::new(config, client),
-            run_id: Uuid::now_v7().to_string(),
-            source_id: source_id.to_owned(),
+            publisher,
+            run_id,
+            source_id,
         }
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn agent_id(&self) -> &str {
+        &self.publisher.agent_id
     }
 
     pub async fn heartbeat(&self) {
@@ -128,7 +170,7 @@ impl SignalPublisher {
             .as_ref()
             .and_then(|base| endpoint_url(base, "ingest/signals").ok());
         Self {
-            agent_id: agent_id(),
+            agent_id: String::new(),
             client,
             endpoint,
             token: config.token.clone(),
@@ -172,19 +214,14 @@ fn signal_id() -> String {
     Uuid::now_v7().to_string()
 }
 
-fn agent_id() -> String {
-    if let Ok(value) = env::var("BASANGO_CRAWLER_AGENT_ID") {
-        if !value.trim().is_empty() {
-            return value;
-        }
-    }
-    // Keep accepting the former variable while deployments migrate.
-    if let Ok(value) = env::var("BASANGO_CRAWLER_NODE_ID") {
-        if !value.trim().is_empty() {
-            return value;
-        }
-    }
-    env::var("HOSTNAME")
-        .or_else(|_| env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| format!("crawler-{}", std::process::id()))
+pub(crate) fn agent_id() -> crate::error::Result<String> {
+    env::var("BASANGO_CRAWLER_AGENT_ID")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            crate::error::CrawlError::Configuration(
+                "BASANGO_CRAWLER_AGENT_ID is required and must be unique for this crawler".into(),
+            )
+        })
 }

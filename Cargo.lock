@@ -147,6 +147,7 @@ dependencies = [
  "httpdate",
  "md5",
  "rand 0.9.5",
+ "redis",
  "regex",
  "reqwest",
  "rusqlite",

@@ -9,11 +9,11 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration, interval};
 
 use crate::{
-    articles::{ArticleIngestionClient, Outbox, ingest},
+    articles::{ArticleIngestionClient, IngestStatus, Outbox, ingest},
     error::{CrawlError, Result},
     execution::{DiscoverJob, FetchJob, JobQueue, Runtime},
     sources::SourceAdapter,
-    telemetry::AgentReporter,
+    telemetry::{AgentReporter, RunMetrics, RunReporter},
 };
 
 pub async fn run_worker(
@@ -21,12 +21,12 @@ pub async fn run_worker(
     queue_names: Vec<String>,
     concurrency: usize,
 ) -> Result<()> {
-    let jobs = Arc::new(JobQueue::connect(&runtime.config.queue).await?);
+    let jobs = Arc::new(JobQueue::connect(&runtime.config.queue, &runtime.agent_id).await?);
     let queue_names = if queue_names.is_empty() {
         jobs.names().into_iter().map(str::to_owned).collect()
     } else {
         jobs.validate_names(&queue_names)?;
-        queue_names
+        jobs.resolve_names(&queue_names)
     };
 
     let outbox = Outbox::open(&runtime.config.sqlite_path(), true)?;
@@ -65,7 +65,11 @@ pub async fn run_worker(
         workers.push(worker);
     }
 
-    let heartbeat_reporter = AgentReporter::new(&runtime.config.ingestion, runtime.http.clone());
+    let heartbeat_reporter = AgentReporter::new(
+        &runtime.config.ingestion,
+        runtime.http.clone(),
+        &runtime.agent_id,
+    );
     let heartbeat_task = tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(15));
         loop {
@@ -112,18 +116,39 @@ async fn process_job(
 ) -> bullmq::Result<Value> {
     match job.name() {
         "discover-source" => {
+            let final_attempt = job.attempts_made() + 1 >= job.opts().attempts.unwrap_or(1);
             let payload: DiscoverJob = serde_json::from_value(job.data().clone())?;
-            process_discovery(runtime, jobs, payload)
+            process_discovery(runtime, jobs, payload, final_attempt)
                 .await
                 .map(|count| json!({ "articlesQueued": count }))
                 .map_err(processing_error)
         }
         "fetch-article" => {
+            let job_id = job.id().to_owned();
+            let final_attempt = job.attempts_made() + 1 >= job.opts().attempts.unwrap_or(1);
             let payload: FetchJob = serde_json::from_value(job.data().clone())?;
-            process_article(runtime, outbox, ingestion, payload)
-                .await
-                .map(|()| Value::Null)
-                .map_err(processing_error)
+            match process_article(runtime, outbox, ingestion, &payload).await {
+                Ok(outcome) => {
+                    report_article_result(runtime, jobs, &payload, &job_id, outcome).await?;
+                    Ok(Value::Null)
+                }
+                Err(error) => {
+                    if final_attempt {
+                        report_article_result(
+                            runtime,
+                            jobs,
+                            &payload,
+                            &job_id,
+                            ArticleRunOutcome {
+                                failed: 1,
+                                ..ArticleRunOutcome::default()
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(processing_error(error))
+                }
+            }
         }
         name => Err(bullmq::Error::Unrecoverable(format!(
             "unknown crawler job '{name}'"
@@ -135,30 +160,87 @@ async fn process_discovery(
     runtime: &Runtime,
     jobs: &JobQueue,
     payload: DiscoverJob,
+    final_attempt: bool,
 ) -> Result<usize> {
     let mut request = payload.request;
-    runtime.resolve_date_range(&mut request).await;
-    let source = runtime.config.source(&request.source_id)?;
-    let mut adapter = SourceAdapter::new(source, runtime.http.clone());
-    let articles = adapter.discover(&request).await?;
-    let count = articles.len();
-    for article in articles {
-        jobs.enqueue_article(FetchJob {
-            request: request.clone(),
-            article,
-        })
-        .await?;
+    let reporter = queued_run_reporter(runtime, &payload.run, &request.source_id);
+    reporter.started().await;
+    let result: Result<usize> = async {
+        runtime.resolve_date_range(&mut request).await;
+        let source = runtime.config.source(&request.source_id)?;
+        let mut adapter = SourceAdapter::new(source, runtime.http.clone());
+        let articles = adapter.discover(&request).await?;
+        let count = articles.len();
+        jobs.initialize_run(&payload.run.run_id, count).await?;
+        let discovered = RunMetrics {
+            articles_discovered: count,
+            ..RunMetrics::default()
+        };
+        if count == 0 {
+            reporter
+                .completed(discovered, queued_duration_ms(payload.run.started_at))
+                .await;
+            return Ok(0);
+        }
+        reporter.progress(discovered).await;
+        for article in articles {
+            jobs.enqueue_article(FetchJob {
+                request: request.clone(),
+                article,
+                run: payload.run.clone(),
+            })
+            .await?;
+        }
+        tracing::info!(source = %request.source_id, count, "discovery job queued articles");
+        Ok(count)
     }
-    tracing::info!(source = %request.source_id, count, "discovery job queued articles");
-    Ok(count)
+    .await;
+
+    if let Err(error) = &result {
+        if final_attempt {
+            let metrics = match jobs.fail_run(&payload.run.run_id).await {
+                Ok(Some(metrics)) => metrics,
+                Ok(None) => RunMetrics::default(),
+                Err(tracking_error) => {
+                    tracing::warn!(
+                        run_id = payload.run.run_id,
+                        %tracking_error,
+                        "could not close queued run progress tracker"
+                    );
+                    RunMetrics::default()
+                }
+            };
+            reporter
+                .failed(
+                    metrics,
+                    queued_duration_ms(payload.run.started_at),
+                    error.to_string(),
+                )
+                .await;
+        } else {
+            tracing::warn!(
+                run_id = payload.run.run_id,
+                %error,
+                "discovery job attempt failed; BullMQ will retry it"
+            );
+        }
+    }
+    result
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ArticleRunOutcome {
+    persisted: usize,
+    delivered: usize,
+    failed: usize,
 }
 
 async fn process_article(
     runtime: &Runtime,
     outbox: &Outbox,
     ingestion: Option<&ArticleIngestionClient>,
-    payload: FetchJob,
-) -> Result<()> {
+    payload: &FetchJob,
+) -> Result<ArticleRunOutcome> {
     let source = runtime.config.source(&payload.request.source_id)?;
     let mut adapter = SourceAdapter::new(source, runtime.http.clone());
     let draft = match adapter.collect(&payload.article, &payload.request).await {
@@ -166,17 +248,83 @@ async fn process_article(
         // These skips are deterministic and should count as successful jobs.
         Err(CrawlError::InvalidArticle(message)) => {
             tracing::info!(%message, url = %payload.article.url, "skipping invalid article");
-            return Ok(());
+            return Ok(ArticleRunOutcome::default());
         }
         Err(CrawlError::ArticleOutOfDateRange { .. }) => {
             tracing::info!(url = %payload.article.url, "skipping out-of-range article");
-            return Ok(());
+            return Ok(ArticleRunOutcome::default());
         }
         Err(error) => return Err(error),
     };
     let (_, status) = ingest(draft, outbox, ingestion).await?;
     tracing::info!(url = %payload.article.url, ?status, "article job completed");
+    Ok(match status {
+        IngestStatus::Persisted => ArticleRunOutcome {
+            persisted: 1,
+            ..ArticleRunOutcome::default()
+        },
+        IngestStatus::AlreadyForwarded | IngestStatus::Forwarded => ArticleRunOutcome {
+            persisted: 1,
+            delivered: 1,
+            failed: 0,
+        },
+        IngestStatus::DeliveryFailed => ArticleRunOutcome {
+            persisted: 1,
+            delivered: 0,
+            failed: 1,
+        },
+    })
+}
+
+async fn report_article_result(
+    runtime: &Runtime,
+    jobs: &JobQueue,
+    payload: &FetchJob,
+    job_id: &str,
+    outcome: ArticleRunOutcome,
+) -> bullmq::Result<()> {
+    let update = jobs
+        .record_run_result(
+            &payload.run.run_id,
+            job_id,
+            outcome.persisted,
+            outcome.delivered,
+            outcome.failed,
+        )
+        .await
+        .map_err(processing_error)?;
+    let Some(update) = update else {
+        return Ok(());
+    };
+    let reporter = queued_run_reporter(runtime, &payload.run, &payload.request.source_id);
+    reporter.progress(update.metrics).await;
+    if update.terminal {
+        reporter
+            .completed(update.metrics, queued_duration_ms(payload.run.started_at))
+            .await;
+    }
     Ok(())
+}
+
+fn queued_run_reporter(
+    runtime: &Runtime,
+    run: &super::queue::QueuedRunContext,
+    source_id: &crate::domain::SourceId,
+) -> RunReporter {
+    RunReporter::with_context(
+        &runtime.config.ingestion,
+        runtime.http.clone(),
+        run.run_id.clone(),
+        run.agent_id.clone(),
+        source_id.to_string(),
+    )
+}
+
+fn queued_duration_ms(started_at: chrono::DateTime<chrono::Utc>) -> u64 {
+    chrono::Utc::now()
+        .signed_duration_since(started_at)
+        .num_milliseconds()
+        .max(0) as u64
 }
 
 fn processing_error(error: CrawlError) -> bullmq::Error {

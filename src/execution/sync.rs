@@ -4,12 +4,15 @@ use std::time::Duration as StdDuration;
 use std::time::Instant;
 
 use chrono::Duration;
-use tokio::time::{Duration as TokioDuration, interval};
+use tokio::{
+    sync::oneshot,
+    time::{Duration as TokioDuration, interval},
+};
 use uuid::Uuid;
 
 use crate::{
     articles::{ArticleIngestionClient, DeliveryResult, IngestStatus, Outbox, ingest},
-    domain::{CrawlRequest, SourceId},
+    domain::{ArticleDraft, CrawlRequest, SourceId},
     error::{CrawlError, Result},
     execution::Runtime,
     sources::SourceAdapter,
@@ -30,6 +33,7 @@ pub async fn crawl_now(runtime: &Runtime, mut request: CrawlRequest) -> Result<C
         &runtime.config.ingestion,
         runtime.http.clone(),
         request.source_id.as_str(),
+        &runtime.agent_id,
     );
     let heartbeat_reporter = reporter.clone();
     let heartbeat_task = tokio::spawn(async move {
@@ -39,15 +43,32 @@ pub async fn crawl_now(runtime: &Runtime, mut request: CrawlRequest) -> Result<C
             heartbeat_reporter.heartbeat().await;
         }
     });
-    let result = crawl_with_reporter(runtime, &mut request, &reporter).await;
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+    let shutdown_task = tokio::spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                let _ = shutdown_sender.send(());
+            }
+            Err(error) => tracing::warn!(%error, "could not listen for Ctrl-C"),
+        }
+    });
+    let result = crawl_with_reporter(runtime, &mut request, &reporter, shutdown_receiver).await;
+    shutdown_task.abort();
     heartbeat_task.abort();
     result
+}
+
+enum CrawlEvent {
+    Draft,
+    ShutdownRequested,
+    ShutdownUnavailable,
 }
 
 async fn crawl_with_reporter(
     runtime: &Runtime,
     request: &mut CrawlRequest,
     reporter: &RunReporter,
+    mut shutdown: oneshot::Receiver<()>,
 ) -> Result<CrawlReport> {
     let started_at = Instant::now();
     reporter.preparing().await;
@@ -63,8 +84,35 @@ async fn crawl_with_reporter(
 
         reporter.started().await;
         let mut drafts = adapter.stream(request.clone());
+        let mut shutdown_available = true;
+        let mut interrupted = false;
 
-        while let Some(item) = drafts.recv().await {
+        loop {
+            let mut next_draft: Option<Option<Result<ArticleDraft>>> = None;
+            let event = tokio::select! {
+                signal = &mut shutdown, if shutdown_available => match signal {
+                    Ok(()) => CrawlEvent::ShutdownRequested,
+                    Err(_) => CrawlEvent::ShutdownUnavailable,
+                },
+                item = drafts.recv() => {
+                    next_draft = Some(item);
+                    CrawlEvent::Draft
+                },
+            };
+            let item = match event {
+                CrawlEvent::Draft => match next_draft.expect("draft event carries a value") {
+                    Some(item) => item,
+                    None => break,
+                },
+                CrawlEvent::ShutdownRequested => {
+                    interrupted = true;
+                    break;
+                }
+                CrawlEvent::ShutdownUnavailable => {
+                    shutdown_available = false;
+                    continue;
+                }
+            };
             let draft = item?;
             report.collected += 1;
             match ingest(draft, &outbox, ingestion.as_ref()).await {
@@ -83,6 +131,17 @@ async fn crawl_with_reporter(
                 }
             }
             reporter.progress((&report).into()).await;
+        }
+
+        if interrupted {
+            tracing::info!(
+                source = %request.source_id,
+                collected = report.collected,
+                stored = report.stored,
+                delivered = report.delivered,
+                failed = report.failed,
+                "Ctrl-C received; completing crawl with persisted progress"
+            );
         }
 
         Ok(())
@@ -111,6 +170,7 @@ pub async fn forward_pending(
     runtime: &Runtime,
     source_id: Option<&SourceId>,
     limit: usize,
+    retry_all: bool,
 ) -> Result<CrawlReport> {
     let outbox_path = runtime.config.sqlite_path();
     if !Outbox::exists(&outbox_path) {
@@ -132,6 +192,7 @@ pub async fn forward_pending(
         &claim_id,
         source_id.map(SourceId::as_str),
         limit,
+        retry_all,
         Duration::from_std(StdDuration::from_secs(15 * 60))
             .expect("15 minutes fits Chrono's duration"),
     )?;
@@ -140,9 +201,36 @@ pub async fn forward_pending(
         stored: articles.len(),
         ..CrawlReport::default()
     };
+    tracing::info!(
+        claimed = articles.len(),
+        retry_all,
+        source = source_id.map(SourceId::as_str).unwrap_or("<all>"),
+        "claimed outbox articles for delivery"
+    );
 
     for record in articles {
-        match ingestion.deliver(&record.article).await {
+        let delivery = tokio::select! {
+            delivery = ingestion.deliver(&record.article) => Some(delivery),
+            signal = tokio::signal::ctrl_c() => match signal {
+                Ok(()) => None,
+                Err(error) => {
+                    tracing::warn!(%error, "could not listen for Ctrl-C during outbox delivery");
+                    Some(ingestion.deliver(&record.article).await)
+                }
+            },
+        };
+        let Some(delivery) = delivery else {
+            let released = outbox.release_claim(&claim_id)?;
+            tracing::info!(
+                delivered = report.delivered,
+                failed = report.failed,
+                released,
+                "Ctrl-C received; released remaining outbox claims"
+            );
+            return Ok(report);
+        };
+
+        match delivery {
             DeliveryResult::Delivered { .. } => {
                 outbox.mark_forwarded(&record.article.hash)?;
                 report.delivered += 1;
@@ -150,6 +238,12 @@ pub async fn forward_pending(
             DeliveryResult::Failed {
                 retryable, message, ..
             } => {
+                tracing::warn!(
+                    url = %record.article.link,
+                    retryable,
+                    error = %message,
+                    "outbox article delivery failed"
+                );
                 outbox.mark_failed(&record.article.hash, &message, retryable)?;
                 report.failed += 1;
             }

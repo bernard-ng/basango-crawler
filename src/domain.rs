@@ -75,12 +75,19 @@ impl<'de> Deserialize<'de> for SourceId {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArticleMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<Url>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<Url>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub published_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
 }
 
@@ -225,6 +232,8 @@ pub struct CrawlRequest {
     pub page_range: Option<PageRange>,
     pub date_range: Option<DateRange>,
     pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<UpdateDirection>,
 }
 
 /// Crawling direction used when the backend supplies an update boundary.
@@ -234,6 +243,20 @@ pub enum UpdateDirection {
     Backward,
     #[default]
     Forward,
+}
+
+impl FromStr for UpdateDirection {
+    type Err = CrawlError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "backward" => Ok(Self::Backward),
+            "forward" => Ok(Self::Forward),
+            _ => Err(CrawlError::InvalidRange(format!(
+                "invalid update direction '{value}'; expected forward or backward"
+            ))),
+        }
+    }
 }
 
 // --- Helpers --------------------------------------------------------------
@@ -272,5 +295,18 @@ mod tests {
         assert_eq!(SourceId::new(" example ").unwrap().as_str(), "example");
         assert!(SourceId::new("   ").is_err());
         assert!(serde_json::from_str::<SourceId>(r#""""#).is_err());
+    }
+
+    #[test]
+    fn absent_metadata_fields_are_omitted_from_api_payloads() {
+        let metadata = ArticleMetadata {
+            title: Some("Article title".into()),
+            ..ArticleMetadata::default()
+        };
+
+        assert_eq!(
+            serde_json::to_value(metadata).unwrap(),
+            serde_json::json!({ "title": "Article title" })
+        );
     }
 }

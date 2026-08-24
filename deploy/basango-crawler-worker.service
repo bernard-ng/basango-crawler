@@ -8,12 +8,18 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/crawler
 EnvironmentFile=/opt/crawler/.env
-ExecStart=/opt/crawler/crawler worker --queue discovery --queue articles
+ExecStart=/opt/crawler/crawler worker
 Restart=always
 RestartSec=10
 User=basango
 Group=basango
 StateDirectory=crawler
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/crawler
 
 [Install]
 WantedBy=multi-user.target

@@ -88,6 +88,12 @@ impl Outbox {
         path.exists()
     }
 
+    /// Remove every locally persisted article while keeping the SQLite schema.
+    pub fn clear(&self) -> Result<usize> {
+        let connection = self.connection()?;
+        Ok(connection.execute("DELETE FROM articles", [])?)
+    }
+
     /// Upsert by hash while preserving an already-forwarded state. This is the
     /// idempotency boundary: crawling the same URL twice does not redeliver it.
     pub fn save(&self, article: &Article) -> Result<DeliveryStatus> {
@@ -186,6 +192,7 @@ impl Outbox {
         claimed_by: &str,
         source_id: Option<&str>,
         limit: usize,
+        retry_all: bool,
         claim_ttl: Duration,
     ) -> Result<Vec<OutboxEntry>> {
         let now = Utc::now();
@@ -195,29 +202,36 @@ impl Outbox {
 
         let select = if source_id.is_some() {
             r#"SELECT hash FROM articles
-               WHERE status IN ('pending', 'failed') AND retryable = 1
-                 AND source_id = ?1 AND (claimed_at IS NULL OR claimed_at < ?2)
-               ORDER BY created_at ASC LIMIT ?3"#
+               WHERE status IN ('pending', 'failed')
+                 AND source_id = ?1 AND (?2 = 1 OR retryable = 1)
+                 AND (claimed_at IS NULL OR claimed_at < ?3)
+               ORDER BY created_at ASC LIMIT ?4"#
         } else {
             r#"SELECT hash FROM articles
-               WHERE status IN ('pending', 'failed') AND retryable = 1
-                 AND (claimed_at IS NULL OR claimed_at < ?1)
-               ORDER BY created_at ASC LIMIT ?2"#
+               WHERE status IN ('pending', 'failed') AND (?1 = 1 OR retryable = 1)
+                 AND (claimed_at IS NULL OR claimed_at < ?2)
+               ORDER BY created_at ASC LIMIT ?3"#
         };
         let hashes = {
             let mut statement = transaction.prepare(select)?;
             if let Some(source_id) = source_id {
                 statement
                     .query_map(
-                        params![source_id, expires_before.to_rfc3339(), limit as i64],
+                        params![
+                            source_id,
+                            retry_all,
+                            expires_before.to_rfc3339(),
+                            limit as i64
+                        ],
                         |row| row.get::<_, String>(0),
                     )?
                     .collect::<std::result::Result<Vec<_>, _>>()?
             } else {
                 statement
-                    .query_map(params![expires_before.to_rfc3339(), limit as i64], |row| {
-                        row.get::<_, String>(0)
-                    })?
+                    .query_map(
+                        params![retry_all, expires_before.to_rfc3339(), limit as i64],
+                        |row| row.get::<_, String>(0),
+                    )?
                     .collect::<std::result::Result<Vec<_>, _>>()?
             }
         };
@@ -259,6 +273,16 @@ impl Outbox {
             params![retryable, error, Utc::now().to_rfc3339(), hash],
         )?;
         Ok(())
+    }
+
+    pub fn release_claim(&self, claimed_by: &str) -> Result<usize> {
+        self.connection()?
+            .execute(
+                r#"UPDATE articles SET claimed_at = NULL, claimed_by = NULL
+                   WHERE claimed_by = ?1"#,
+                [claimed_by],
+            )
+            .map_err(Into::into)
     }
 
     pub fn get(&self, hash: &str) -> Result<Option<OutboxEntry>> {
@@ -407,14 +431,81 @@ mod tests {
         outbox.save(&article()).unwrap();
 
         let claimed = outbox
-            .claim("worker-1", None, 10, Duration::minutes(15))
+            .claim("worker-1", None, 10, false, Duration::minutes(15))
             .unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].claimed_by.as_deref(), Some("worker-1"));
 
         let second = outbox
-            .claim("worker-2", None, 10, Duration::minutes(15))
+            .claim("worker-2", None, 10, false, Duration::minutes(15))
             .unwrap();
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn retry_all_claims_non_retryable_failures_after_a_client_fix() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("outbox.db");
+        let outbox = Outbox::open(&path, true).unwrap();
+        let article = article();
+        outbox.save(&article).unwrap();
+        outbox
+            .mark_failed(&article.hash, "HTTP 400 from an old payload", false)
+            .unwrap();
+
+        assert!(
+            outbox
+                .claim("normal", None, 10, false, Duration::minutes(15))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            outbox
+                .claim("manual", None, 10, true, Duration::minutes(15))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn releasing_a_claim_makes_an_interrupted_batch_available_again() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("outbox.db");
+        let outbox = Outbox::open(&path, true).unwrap();
+        outbox.save(&article()).unwrap();
+        assert_eq!(
+            outbox
+                .claim("interrupted", None, 10, false, Duration::minutes(15))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert_eq!(outbox.release_claim("interrupted").unwrap(), 1);
+        assert_eq!(
+            outbox
+                .claim("replacement", None, 10, false, Duration::minutes(15))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn clear_empties_the_outbox_without_removing_its_schema() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("outbox.db");
+        let outbox = Outbox::open(&path, true).unwrap();
+        outbox.save(&article()).unwrap();
+
+        assert_eq!(outbox.clear().unwrap(), 1);
+        assert!(
+            outbox
+                .claim("worker", None, 10, true, Duration::minutes(15))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(outbox.clear().unwrap(), 0);
     }
 }

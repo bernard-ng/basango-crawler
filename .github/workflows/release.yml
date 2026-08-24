@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin crawler
+
+      - name: Package executable
+        run: tar -C target/release -czf crawler-linux-${{ matrix.arch }}.tar.gz crawler
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawler-linux-${{ matrix.arch }}
+          path: crawler-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download executable artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --generate-notes --verify-tag
+          fi

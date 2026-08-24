@@ -6,5 +6,5 @@
 mod reporter;
 mod signal;
 
-pub(crate) use reporter::{AgentReporter, RunReporter};
+pub(crate) use reporter::{AgentReporter, RunReporter, agent_id};
 pub(crate) use signal::RunMetrics;

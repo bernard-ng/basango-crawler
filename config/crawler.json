@@ -47,6 +47,7 @@
       "kind": "html",
       "id": "7sur7.cd",
       "url": "https://7sur7.cd",
+      "date_format": "yyyy-LL-dd'T'HH:mm:ssxx",
       "fetch_details": true,
       "pagination_template": "index.php/category/{category}",
       "selectors": {

@@ -12,7 +12,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     Crawler,
-    domain::{CrawlRequest, DateRange, PageRange, SourceId},
+    domain::{CrawlRequest, DateRange, PageRange, SourceId, UpdateDirection},
+    error::CrawlError,
 };
 
 #[derive(Debug, Parser)]
@@ -42,6 +43,9 @@ enum Command {
     /// Deliver pending or failed articles from the SQLite outbox.
     #[command(alias = "push")]
     Deliver(DeliverArgs),
+    /// Clear this agent's queues, run trackers, and SQLite outbox.
+    #[command(alias = "reset")]
+    ResetAgent(ResetAgentArgs),
     /// Print version information (also available as --version).
     Version,
 }
@@ -60,6 +64,9 @@ struct CrawlArgs {
     /// Optional configured category slug.
     #[arg(long)]
     category: Option<String>,
+    /// Override the configured update direction for this crawl.
+    #[arg(long, value_parser = parse_update_direction)]
+    direction: Option<UpdateDirection>,
 }
 
 #[derive(Debug, Args)]
@@ -76,6 +83,9 @@ struct ScheduleArgs {
     /// Optional configured category slug.
     #[arg(long)]
     category: Option<String>,
+    /// Persist the update direction in each scheduled discovery job.
+    #[arg(long, value_parser = parse_update_direction)]
+    direction: Option<UpdateDirection>,
 }
 
 #[derive(Debug, Args)]
@@ -96,6 +106,16 @@ struct DeliverArgs {
     /// Maximum number of outbox rows to claim.
     #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
     limit: usize,
+    /// Retry failures previously classified as non-retryable (for example after fixing a payload).
+    #[arg(long)]
+    retry_all: bool,
+}
+
+#[derive(Debug, Args)]
+struct ResetAgentArgs {
+    /// Also remove the former unscoped queues; use only during the one-time agent-prefix migration.
+    #[arg(long)]
+    include_legacy_queues: bool,
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -129,12 +149,20 @@ pub async fn run() -> anyhow::Result<()> {
         }
         Command::Deliver(arguments) => {
             let report = crawler
-                .deliver_pending(arguments.source_id.as_ref(), arguments.limit)
+                .deliver_pending(
+                    arguments.source_id.as_ref(),
+                    arguments.limit,
+                    arguments.retry_all,
+                )
                 .await?;
             tracing::info!(?report, "outbox delivery completed");
             if report.failed > 0 {
                 bail!("failed to deliver {} article(s)", report.failed);
             }
+        }
+        Command::ResetAgent(arguments) => {
+            let report = crawler.reset_agent(arguments.include_legacy_queues).await?;
+            tracing::info!(?report, "agent state reset");
         }
         Command::Version => unreachable!("handled before configuration loading"),
     }
@@ -164,6 +192,7 @@ async fn schedule(crawler: &Crawler, arguments: ScheduleArgs) -> anyhow::Result<
                 page_range: arguments.page_range,
                 date_range: arguments.date_range,
                 category: arguments.category.clone(),
+                direction: arguments.direction,
             })
             .await?;
         tracing::info!(job_id = id, %source_id, "scheduled source discovery");
@@ -178,6 +207,7 @@ impl From<CrawlArgs> for CrawlRequest {
             page_range: value.page_range,
             date_range: value.date_range,
             category: value.category,
+            direction: value.direction,
         }
     }
 }
@@ -188,6 +218,10 @@ fn parse_page_range(value: &str) -> Result<PageRange, String> {
 
 fn parse_date_range(value: &str) -> Result<DateRange, String> {
     DateRange::parse(value).map_err(|error| error.to_string())
+}
+
+fn parse_update_direction(value: &str) -> Result<UpdateDirection, String> {
+    value.parse().map_err(|error: CrawlError| error.to_string())
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
@@ -224,11 +258,14 @@ mod tests {
             "1:3",
             "--date-range",
             "2025-01-01:2025-01-31",
+            "--direction",
+            "backward",
         ])
         .unwrap();
         let Command::Crawl(arguments) = cli.command else {
             panic!("expected crawl command")
         };
         assert_eq!(arguments.page_range.unwrap(), PageRange::new(1, 3).unwrap());
+        assert_eq!(arguments.direction, Some(UpdateDirection::Backward));
     }
 }

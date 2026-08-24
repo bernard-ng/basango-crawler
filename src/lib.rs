@@ -16,7 +16,7 @@ mod sources;
 mod telemetry;
 
 pub use articles::{DeliveryStatus, Outbox, OutboxEntry, normalize};
-pub use crawler::Crawler;
+pub use crawler::{AgentResetReport, Crawler};
 pub use domain::{
     Article, ArticleDraft, ArticleMetadata, CrawlRequest, DateRange, PageRange, SourceId,
     UpdateDirection,

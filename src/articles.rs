@@ -57,6 +57,12 @@ pub async fn ingest(
         DeliveryResult::Failed {
             retryable, message, ..
         } => {
+            tracing::warn!(
+                url = %article.link,
+                retryable,
+                error = %message,
+                "article forwarding failed; retained in outbox"
+            );
             outbox.mark_failed(&article.hash, &message, retryable)?;
             Ok((article, IngestStatus::DeliveryFailed))
         }

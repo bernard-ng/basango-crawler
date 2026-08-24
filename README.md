@@ -82,7 +82,7 @@ Configuration is organized by capability under `src/config/`. `zod-rs` validates
 BASANGO_API_CRAWLER_ENDPOINT=https://api.basango.example
 BASANGO_API_CRAWLER_TOKEN=replace-with-the-api-crawler-token
 
-# Stable agent name displayed in ingestion operations; defaults to the hostname
+# Required stable identity; use a unique value on every Raspberry Pi
 BASANGO_CRAWLER_AGENT_ID=crawler-lubumbashi-01
 ```
 
@@ -92,7 +92,7 @@ With the API configured, the crawler sends:
 - lifecycle signals and heartbeats to `POST /ingest/signals`;
 - update-window lookups to `POST /ingest/sources/publication-bounds`.
 
-Article collection continues if signal reporting is temporarily unavailable. Failed article delivery remains durable in the SQLite outbox. `BASANGO_CRAWLER_NODE_ID` remains a temporary compatibility alias for the renamed agent ID variable.
+`BASANGO_CRAWLER_AGENT_ID` is mandatory. Crawler startup fails when it is absent, preventing two devices from silently sharing an identity. Article collection continues if signal reporting is temporarily unavailable, and failed article delivery remains durable in the SQLite outbox.
 
 ### Signal protocol
 
@@ -101,6 +101,7 @@ The crawler emits a small discriminated protocol instead of loosely shaped event
 | Signal | Meaning |
 |---|---|
 | `agent.heartbeat` | The worker process is reachable |
+| `agent.reset` | This agent's queues and local outbox were intentionally cleared |
 | `run.preparing` | A direct source run is resolving its inputs |
 | `run.started` | Collection has started |
 | `run.progress` | Absolute discovered, persisted, delivered, and failed totals |
@@ -130,6 +131,8 @@ BASANGO_CRAWLER_RETAIN_COMPLETED=3600
 BASANGO_CRAWLER_RETAIN_FAILED=86400
 ```
 
+The effective BullMQ queue names are automatically prefixed with the required agent ID. For example, `basango-pi-01` uses `basango-pi-01-discovery` and `basango-pi-01-articles`. This lets 5–10 Raspberry Pis safely share one Redis server while each worker consumes only its own jobs. Keep the configured queue values as the short suffixes shown above.
+
 See [`.env.example`](.env.example) and [`config/crawler.json`](config/crawler.json) for all supported values and source examples.
 
 ## Usage
@@ -143,6 +146,7 @@ cargo run -- crawl --source-id radiookapi.net
 cargo run -- crawl --source-id radiookapi.net --page-range 1:5
 cargo run -- crawl --source-id radiookapi.net --date-range 2025-01-01:2025-01-31
 cargo run -- crawl --source-id 7sur7.cd --category politique
+cargo run -- crawl --source-id 7sur7.cd --category politique --direction backward
 ```
 
 ### Queued crawling
@@ -164,6 +168,18 @@ cargo run -- worker --queue discovery --queue articles --concurrency 5
 
 Workers publish an agent heartbeat every 15 seconds. Stop them gracefully with `Ctrl-C`.
 
+### Resetting one agent
+
+Stop the worker first, then clear only the current agent's queues, queued-run trackers, and SQLite outbox:
+
+```bash
+cargo run -- reset-agent
+```
+
+The command derives its scope from `BASANGO_CRAWLER_AGENT_ID`; it does not touch another Raspberry Pi's queues or the canonical articles stored by the Basango API.
+
+When upgrading the original single-agent deployment, the old queues were not scoped. After stopping every old worker, remove them once with `cargo run -- reset-agent --include-legacy-queues`. Never use that flag after multiple agents begin sharing Redis.
+
 ### Delivering the outbox
 
 Retry pending or failed API deliveries:
@@ -171,7 +187,11 @@ Retry pending or failed API deliveries:
 ```bash
 cargo run -- deliver --limit 100
 cargo run -- deliver --source-id radiookapi.net --limit 50
+cargo run -- deliver --retry-all --limit 100
 ```
+
+Use `--retry-all` after fixing a client-side payload or authentication problem
+to retry failures that were previously classified as non-retryable.
 
 ### External configuration
 
@@ -189,6 +209,7 @@ cargo run -- --config /path/to/crawler.json crawl --source-id radiookapi.net
 | `schedule` | Enqueue one or more source discovery jobs |
 | `worker` | Process discovery and article queues |
 | `deliver` (`push`) | Retry durable outbox deliveries |
+| `reset-agent` (`reset`) | Empty this agent's queues, run trackers, and SQLite outbox |
 | `version` | Print the crawler version |
 
 Common crawl flags:
@@ -199,6 +220,7 @@ Common crawl flags:
 | `--page-range` | Inclusive page range | `--page-range 1:5` |
 | `--date-range` | Inclusive UTC date window | `--date-range 2025-01-01:2025-01-31` |
 | `--category` | Configured source category | `--category politique` |
+| `--direction` | Override update direction for this crawl/job | `--direction backward` |
 
 ## Realtime ingestion operations
 
@@ -214,7 +236,15 @@ The dashboard receives lightweight server-sent invalidations and reloads the dur
 
 ## Deployment
 
-Example systemd units for the scheduler and worker are in [`deploy/`](deploy/). Production crawler processes are intentionally managed from this repository, not from the TypeScript monorepo's PM2 configuration.
+An idempotent Raspberry Pi installer and systemd units are in [`deploy/`](deploy/). Run the installer as root and provide an executable or `.tar.gz` asset URL from a GitHub release:
+
+```bash
+sudo ./deploy/install.sh https://github.com/bernard-ng/basango-rs/releases/download/v0.1.0/crawler-linux-aarch64.tar.gz
+```
+
+On the first run it creates the service account, persistent directories, mandatory agent configuration, worker service, and scheduler timer. Later runs preserve `.env`, replace the binary after validating it, refresh the units, and restart the services.
+
+Pushing a `v*` Git tag publishes native Linux archives for Raspberry Pi `aarch64` and `x86_64`; the resulting release asset URL can be passed directly to the installer.
 
 Build and validate before deployment:
 

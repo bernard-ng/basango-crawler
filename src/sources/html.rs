@@ -37,22 +37,66 @@ impl HtmlCrawler {
             None => self.pagination(request.category.as_deref()).await?,
         };
 
-        for page in page_range.start..=page_range.end {
+        tracing::info!(
+            source = %self.source.common.id,
+            category = request.category.as_deref().unwrap_or("<none>"),
+            pages = %page_range,
+            date_start = request.date_range.map(|range| range.start.to_rfc3339()).as_deref(),
+            date_end = request.date_range.map(|range| range.end.to_rfc3339()).as_deref(),
+            "starting HTML crawl"
+        );
+
+        let mut successful_pages = 0usize;
+        let mut matched_entries = 0usize;
+        let mut emitted_articles = 0usize;
+        let mut filtered_articles = 0usize;
+        let mut detail_fetch_failures = 0usize;
+        let mut parse_failures = 0usize;
+        let mut missing_links = 0usize;
+        let mut first_fetch_error = None;
+
+        'pages: for page in page_range.start..=page_range.end {
             let endpoint = self.endpoint_url(page, request.category.as_deref())?;
+            tracing::debug!(
+                source = %self.source.common.id,
+                %endpoint,
+                page,
+                "fetching HTML listing"
+            );
             let listing = match self.fetch_text(&endpoint).await {
                 Ok(listing) => listing,
                 Err(error) => {
                     tracing::error!(%error, %endpoint, page, "failed to fetch HTML listing");
+                    if first_fetch_error.is_none() {
+                        first_fetch_error = Some(error);
+                    }
                     continue;
                 }
             };
+            successful_pages += 1;
             let entries = self.listing_entries(&listing)?;
+            matched_entries += entries.len();
+            tracing::info!(
+                source = %self.source.common.id,
+                %endpoint,
+                page,
+                entries = entries.len(),
+                selector = %self.source.selectors.list,
+                "parsed HTML listing"
+            );
             if entries.is_empty() {
-                tracing::warn!(page, %endpoint, "HTML listing contained no matching articles");
+                tracing::warn!(
+                    source = %self.source.common.id,
+                    page,
+                    %endpoint,
+                    selector = %self.source.selectors.list,
+                    "HTML listing contained no matching articles"
+                );
             }
 
             for entry in entries {
                 let Some(link) = self.extract_link(&entry)? else {
+                    missing_links += 1;
                     tracing::warn!(page, "skipping HTML listing entry without a link");
                     continue;
                 };
@@ -60,6 +104,7 @@ impl HtmlCrawler {
                     match self.fetch_text(&link).await {
                         Ok(html) => html,
                         Err(error) => {
+                            detail_fetch_failures += 1;
                             tracing::error!(%error, %link, "failed to fetch HTML detail page");
                             continue;
                         }
@@ -73,21 +118,60 @@ impl HtmlCrawler {
                         if let Some(range) = request.date_range {
                             if range.is_older_than_range(draft.published_at) {
                                 // Listings are newest-first. This is a control
-                                // signal, not a failure, so return collected data.
-                                return Ok(());
+                                // signal, not a failure, so stop after collected data.
+                                filtered_articles += 1;
+                                tracing::info!(
+                                    source = %self.source.common.id,
+                                    %link,
+                                    published_at = %draft.published_at,
+                                    range_start = %range.start,
+                                    "stopping at article older than the publication date range"
+                                );
+                                break 'pages;
                             }
                             if !range.contains(draft.published_at) {
+                                filtered_articles += 1;
+                                tracing::debug!(
+                                    source = %self.source.common.id,
+                                    %link,
+                                    published_at = %draft.published_at,
+                                    range_start = %range.start,
+                                    range_end = %range.end,
+                                    "skipping article outside the publication date range"
+                                );
                                 continue;
                             }
                         }
                         if sender.send(Ok(draft)).await.is_err() {
-                            return Ok(());
+                            break 'pages;
                         }
+                        emitted_articles += 1;
                     }
-                    Err(error) => tracing::error!(%error, %link, "failed to parse HTML article"),
+                    Err(error) => {
+                        parse_failures += 1;
+                        tracing::error!(%error, %link, "failed to parse HTML article");
+                    }
                 }
             }
         }
+
+        if successful_pages == 0 {
+            return Err(first_fetch_error.unwrap_or_else(|| {
+                CrawlError::Configuration("HTML crawl did not fetch any listing pages".into())
+            }));
+        }
+
+        tracing::info!(
+            source = %self.source.common.id,
+            successful_pages,
+            matched_entries,
+            emitted_articles,
+            filtered_articles,
+            detail_fetch_failures,
+            parse_failures,
+            missing_links,
+            "HTML crawl finished"
+        );
         Ok(())
     }
 
