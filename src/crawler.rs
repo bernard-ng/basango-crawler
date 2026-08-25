@@ -2,14 +2,16 @@
 
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
+
 use crate::{
-    articles::Outbox,
+    articles::{Outbox, OutboxStats},
     config::CrawlerConfig,
     domain::{CrawlRequest, SourceId},
     error::Result,
     execution::{
-        CrawlReport, DiscoverJob, JobQueue, QueueResetReport, QueuedRunContext, Runtime, crawl_now,
-        forward_pending, run_worker,
+        CrawlReport, DiscoverJob, JobQueue, QueueResetReport, QueueSnapshot, QueuedRunContext,
+        Runtime, crawl_now, forward_pending, run_worker,
     },
     telemetry::{AgentReporter, RunMetrics, RunReporter},
 };
@@ -21,6 +23,46 @@ pub struct AgentResetReport {
     pub articles_queue: String,
     pub progress_trackers_removed: usize,
     pub outbox_articles_removed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueStatus {
+    pub name: String,
+    pub workers: usize,
+    pub waiting: u64,
+    pub active: u64,
+    pub delayed: u64,
+    pub prioritized: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub waiting_children: u64,
+    pub paused: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRunStatus {
+    pub run_id: String,
+    pub source_id: String,
+    pub started_at: DateTime<Utc>,
+    pub discovered: usize,
+    pub processed: usize,
+    pub persisted: usize,
+    pub delivered: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedisStatus {
+    pub queues: Vec<QueueStatus>,
+    pub open_runs: Vec<OpenRunStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrawlerStatus {
+    pub agent_id: String,
+    pub sqlite_path: PathBuf,
+    pub outbox: std::result::Result<OutboxStats, String>,
+    pub redis: std::result::Result<RedisStatus, String>,
 }
 
 /// A configured crawler with reusable HTTP connections.
@@ -114,6 +156,49 @@ impl Crawler {
         run_worker(self.runtime.clone(), queues, concurrency).await
     }
 
+    /// Read the current agent's local outbox and Redis queue state.
+    pub async fn status(&self) -> CrawlerStatus {
+        let sqlite_path = self.runtime.config.sqlite_path();
+        let outbox = if Outbox::exists(&sqlite_path) {
+            Outbox::open(&sqlite_path, false)
+                .and_then(|outbox| outbox.stats())
+                .map_err(|error| error.to_string())
+        } else {
+            Err("not initialized".to_owned())
+        };
+
+        let redis = async {
+            let queue =
+                JobQueue::connect(&self.runtime.config.queue, &self.runtime.agent_id).await?;
+            let (queues, open_runs) = queue.status().await?;
+            Ok::<RedisStatus, crate::error::CrawlError>(RedisStatus {
+                queues: queues.into_iter().map(QueueStatus::from).collect(),
+                open_runs: open_runs
+                    .into_iter()
+                    .map(|run| OpenRunStatus {
+                        run_id: run.run.run_id,
+                        source_id: run.source_id.to_string(),
+                        started_at: run.run.started_at,
+                        discovered: run.metrics.articles_discovered,
+                        processed: run.processed,
+                        persisted: run.metrics.articles_persisted,
+                        delivered: run.metrics.articles_delivered,
+                        failed: run.metrics.articles_failed,
+                    })
+                    .collect(),
+            })
+        }
+        .await
+        .map_err(|error| error.to_string());
+
+        CrawlerStatus {
+            agent_id: self.runtime.agent_id.clone(),
+            sqlite_path,
+            outbox,
+            redis,
+        }
+    }
+
     /// Clear this agent's BullMQ state and local SQLite outbox.
     pub async fn reset_agent(&self) -> Result<AgentResetReport> {
         let queue = JobQueue::connect(&self.runtime.config.queue, &self.runtime.agent_id).await?;
@@ -139,5 +224,22 @@ impl Crawler {
             progress_trackers_removed,
             outbox_articles_removed,
         })
+    }
+}
+
+impl From<QueueSnapshot> for QueueStatus {
+    fn from(snapshot: QueueSnapshot) -> Self {
+        Self {
+            name: snapshot.name,
+            workers: snapshot.workers,
+            waiting: snapshot.waiting,
+            active: snapshot.active,
+            delayed: snapshot.delayed,
+            prioritized: snapshot.prioritized,
+            completed: snapshot.completed,
+            failed: snapshot.failed,
+            waiting_children: snapshot.waiting_children,
+            paused: snapshot.paused,
+        }
     }
 }

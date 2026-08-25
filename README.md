@@ -62,6 +62,13 @@ sudo -u basango ./crawler crawl --source-id 7sur7.cd --category sport --directio
 
 ### Maintenance
 
+Show the current agent's Redis queues, open runs, and SQLite outbox:
+
+```bash
+cd /opt/crawler
+sudo -u basango ./crawler status
+```
+
 Retry pending article deliveries:
 
 ```bash

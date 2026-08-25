@@ -56,6 +56,16 @@ pub struct OutboxEntry {
     pub claimed_by: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutboxStats {
+    pub total: usize,
+    pub pending: usize,
+    pub forwarded: usize,
+    pub failed: usize,
+    pub retryable_failed: usize,
+    pub claimed: usize,
+}
+
 #[derive(Clone)]
 pub struct Outbox {
     connection: Arc<Mutex<Connection>>,
@@ -92,6 +102,32 @@ impl Outbox {
     pub fn clear(&self) -> Result<usize> {
         let connection = self.connection()?;
         Ok(connection.execute("DELETE FROM articles", [])?)
+    }
+
+    pub fn stats(&self) -> Result<OutboxStats> {
+        self.connection()?
+            .query_row(
+                r#"SELECT
+                    COUNT(*),
+                    COALESCE(SUM(status = 'pending'), 0),
+                    COALESCE(SUM(status = 'forwarded'), 0),
+                    COALESCE(SUM(status = 'failed'), 0),
+                    COALESCE(SUM(status = 'failed' AND retryable = 1), 0),
+                    COALESCE(SUM(claimed_at IS NOT NULL), 0)
+                FROM articles"#,
+                [],
+                |row| {
+                    Ok(OutboxStats {
+                        total: row.get(0)?,
+                        pending: row.get(1)?,
+                        forwarded: row.get(2)?,
+                        failed: row.get(3)?,
+                        retryable_failed: row.get(4)?,
+                        claimed: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 
     /// Upsert by hash while preserving an already-forwarded state. This is the
@@ -507,5 +543,41 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(outbox.clear().unwrap(), 0);
+    }
+
+    #[test]
+    fn stats_summarize_delivery_and_claim_state() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("outbox.db");
+        let outbox = Outbox::open(&path, true).unwrap();
+        let first = article();
+        outbox.save(&first).unwrap();
+        outbox
+            .claim("worker", None, 1, false, Duration::minutes(15))
+            .unwrap();
+
+        let mut second = article();
+        second.hash = "hash-2".into();
+        second.link = Url::parse("https://example.com/two").unwrap();
+        outbox.save(&second).unwrap();
+        outbox.mark_failed(&second.hash, "temporary", true).unwrap();
+
+        let mut third = article();
+        third.hash = "hash-3".into();
+        third.link = Url::parse("https://example.com/three").unwrap();
+        outbox.save(&third).unwrap();
+        outbox.mark_forwarded(&third.hash).unwrap();
+
+        assert_eq!(
+            outbox.stats().unwrap(),
+            OutboxStats {
+                total: 3,
+                pending: 1,
+                forwarded: 1,
+                failed: 1,
+                retryable_failed: 1,
+                claimed: 1,
+            }
+        );
     }
 }

@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    Crawler,
+    Crawler, CrawlerStatus,
     domain::{CrawlRequest, DateRange, PageRange, SourceId, UpdateDirection},
     error::CrawlError,
 };
@@ -43,6 +43,8 @@ enum Command {
     /// Deliver pending or failed articles from the SQLite outbox.
     #[command(alias = "push")]
     Deliver(DeliverArgs),
+    /// Show this agent's Redis queues, open runs, and SQLite outbox state.
+    Status,
     /// Clear this agent's queues, run trackers, and SQLite outbox.
     #[command(alias = "reset")]
     ResetAgent,
@@ -153,6 +155,7 @@ pub async fn run() -> anyhow::Result<()> {
                 bail!("failed to deliver {} article(s)", report.failed);
             }
         }
+        Command::Status => print_status(&crawler.status().await),
         Command::ResetAgent => {
             let report = crawler.reset_agent().await?;
             tracing::info!(?report, "agent state reset");
@@ -160,6 +163,66 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Version => unreachable!("handled before configuration loading"),
     }
     Ok(())
+}
+
+fn print_status(status: &CrawlerStatus) {
+    println!("Crawler status");
+    println!("  Agent:  {}", status.agent_id);
+    println!();
+    println!("SQLite");
+    println!("  Path:   {}", status.sqlite_path.display());
+    match &status.outbox {
+        Ok(outbox) => {
+            println!("  State:  available");
+            println!(
+                "  Rows:   {} total | {} pending | {} forwarded | {} failed | {} claimed",
+                outbox.total, outbox.pending, outbox.forwarded, outbox.failed, outbox.claimed
+            );
+            println!("  Retryable failures: {}", outbox.retryable_failed);
+        }
+        Err(error) => println!("  State:  unavailable ({error})"),
+    }
+
+    println!();
+    println!("Redis");
+    match &status.redis {
+        Ok(redis) => {
+            println!("  State:  connected");
+            for queue in &redis.queues {
+                println!("  {}", queue.name);
+                println!(
+                    "    workers {} | waiting {} | active {} | delayed {} | failed {} | completed {}",
+                    queue.workers,
+                    queue.waiting + queue.paused,
+                    queue.active,
+                    queue.delayed,
+                    queue.failed,
+                    queue.completed
+                );
+                if queue.prioritized > 0 || queue.waiting_children > 0 {
+                    println!(
+                        "    prioritized {} | waiting for children {}",
+                        queue.prioritized, queue.waiting_children
+                    );
+                }
+            }
+
+            println!("  Open runs: {}", redis.open_runs.len());
+            for run in &redis.open_runs {
+                println!(
+                    "    {} | {} | started {}",
+                    run.source_id,
+                    run.run_id,
+                    run.started_at.to_rfc3339()
+                );
+                println!(
+                    "      discovered {} | processed {} | persisted {} | delivered {} | failed {}",
+                    run.discovered, run.processed, run.persisted, run.delivered, run.failed
+                );
+            }
+        }
+        Err(error) => println!("  State:  unavailable ({error})"),
+    }
 }
 
 async fn schedule(crawler: &Crawler, arguments: ScheduleArgs) -> anyhow::Result<()> {
@@ -260,5 +323,11 @@ mod tests {
         };
         assert_eq!(arguments.page_range.unwrap(), PageRange::new(1, 3).unwrap());
         assert_eq!(arguments.direction, Some(UpdateDirection::Backward));
+    }
+
+    #[test]
+    fn status_is_a_standalone_command() {
+        let cli = Cli::try_parse_from(["crawler", "status"]).unwrap();
+        assert!(matches!(cli.command, Command::Status));
     }
 }

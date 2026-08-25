@@ -13,7 +13,7 @@ use crate::{
     domain::{ArticleDraft, ArticleMetadata, CrawlRequest, PageRange},
     error::{CrawlError, Result},
     http::{HttpClient, consume_open_graph_url},
-    sources::{ArticleSeed, common},
+    sources::{ArticleSeed, DiscoveryBatch, common},
 };
 
 const POST_FIELDS: &str =
@@ -115,23 +115,54 @@ impl WordPressCrawler {
         Ok(())
     }
 
-    pub async fn discover(&self, request: &CrawlRequest) -> Result<Vec<ArticleSeed>> {
+    pub async fn discover_into(
+        &self,
+        request: &CrawlRequest,
+        sender: &mpsc::Sender<Result<DiscoveryBatch>>,
+    ) -> Result<()> {
         let range = match request.page_range {
             Some(range) => range,
             None => self.pagination().await?,
         };
-        let mut locations = Vec::new();
+        tracing::info!(
+            source = %self.source.common.id,
+            pages = %range,
+            "starting WordPress discovery"
+        );
+        let mut total_discovered = 0usize;
         for page in range.start..=range.end {
-            for post in self.fetch_page(page).await? {
+            let posts = self.fetch_page(page).await?;
+            let mut articles = Vec::new();
+            for post in &posts {
                 if let Some(url) = post.link.clone() {
-                    locations.push(ArticleSeed {
+                    articles.push(ArticleSeed {
                         url,
                         data: Some(serde_json::to_value(post)?),
                     });
                 }
             }
+            total_discovered += articles.len();
+            tracing::info!(
+                source = %self.source.common.id,
+                page,
+                last_page = range.end,
+                posts = posts.len(),
+                discovered = articles.len(),
+                total_discovered,
+                "WordPress discovery page completed"
+            );
+            if sender
+                .send(Ok(DiscoveryBatch {
+                    id: format!("page:{page}"),
+                    articles,
+                }))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
         }
-        Ok(locations)
+        Ok(())
     }
 
     pub async fn collect(

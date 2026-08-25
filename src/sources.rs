@@ -28,6 +28,12 @@ pub struct ArticleSeed {
     pub data: Option<Value>,
 }
 
+#[derive(Debug)]
+pub struct DiscoveryBatch {
+    pub id: String,
+    pub articles: Vec<ArticleSeed>,
+}
+
 pub enum SourceAdapter {
     Html(html::HtmlCrawler),
     WordPress(wordpress::WordPressCrawler),
@@ -59,11 +65,24 @@ impl SourceAdapter {
         receiver
     }
 
-    pub async fn discover(&mut self, request: &CrawlRequest) -> Result<Vec<ArticleSeed>> {
-        match self {
-            Self::Html(crawler) => crawler.discover(request).await,
-            Self::WordPress(crawler) => crawler.discover(request).await,
-        }
+    /// Discover article jobs page by page so queueing and telemetry can progress
+    /// while the remaining archive pages are still being scanned.
+    pub fn stream_discovery(
+        mut self,
+        request: CrawlRequest,
+    ) -> mpsc::Receiver<Result<DiscoveryBatch>> {
+        const BUFFERED_PAGES: usize = 4;
+        let (sender, receiver) = mpsc::channel(BUFFERED_PAGES);
+        tokio::spawn(async move {
+            let result = match &mut self {
+                Self::Html(crawler) => crawler.discover_into(&request, &sender).await,
+                Self::WordPress(crawler) => crawler.discover_into(&request, &sender).await,
+            };
+            if let Err(error) = result {
+                let _ = sender.send(Err(error)).await;
+            }
+        });
+        receiver
     }
 
     pub async fn collect(

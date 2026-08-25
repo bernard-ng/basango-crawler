@@ -15,8 +15,10 @@ mod http;
 mod sources;
 mod telemetry;
 
-pub use articles::{DeliveryStatus, Outbox, OutboxEntry, normalize};
-pub use crawler::{AgentResetReport, Crawler};
+pub use articles::{DeliveryStatus, Outbox, OutboxEntry, OutboxStats, normalize};
+pub use crawler::{
+    AgentResetReport, Crawler, CrawlerStatus, OpenRunStatus, QueueStatus, RedisStatus,
+};
 pub use domain::{
     Article, ArticleDraft, ArticleMetadata, CrawlRequest, DateRange, PageRange, SourceId,
     UpdateDirection,

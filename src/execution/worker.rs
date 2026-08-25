@@ -78,7 +78,13 @@ pub async fn run_worker(
         }
     });
 
-    tracing::info!(?queue_names, concurrency, "BullMQ crawler worker started");
+    tracing::info!(
+        agent_id = runtime.agent_id,
+        queue_prefix = runtime.config.queue.prefix,
+        ?queue_names,
+        concurrency,
+        "BullMQ crawler worker started"
+    );
     tokio::signal::ctrl_c().await.map_err(CrawlError::Io)?;
     heartbeat_task.abort();
     tracing::info!("shutdown requested; draining BullMQ workers");
@@ -134,6 +140,12 @@ async fn process_job(
     ingestion: Option<&ArticleIngestionClient>,
     job: Job,
 ) -> bullmq::Result<Value> {
+    tracing::info!(
+        agent_id = runtime.agent_id,
+        job_id = job.id(),
+        job_name = job.name(),
+        "processing BullMQ job"
+    );
     match job.name() {
         "discover-source" => {
             let final_attempt = job.attempts_made() + 1 >= job.opts().attempts.unwrap_or(1);
@@ -211,37 +223,44 @@ async fn process_discovery(
     let result: Result<usize> = async {
         runtime.resolve_date_range(&mut request).await;
         let source = runtime.config.source(&request.source_id)?;
-        let mut adapter = SourceAdapter::new(source, runtime.http.clone());
-        let articles = adapter.discover(&request).await?;
-        let count = articles.len();
-        if !jobs.initialize_run(&payload.run.run_id, count).await? {
-            tracing::info!(
-                run_id = payload.run.run_id,
-                source = %request.source_id,
-                "queued run was already completed; skipping discovered articles"
-            );
-            return Ok(0);
-        }
-        let discovered = RunMetrics {
-            articles_discovered: count,
-            ..RunMetrics::default()
-        };
-        if count == 0 {
-            if let Some(metrics) = jobs.complete_run(&payload.run.run_id).await? {
-                reporter
-                    .completed(metrics, queued_duration_ms(payload.run.started_at))
-                    .await;
+        let adapter = SourceAdapter::new(source, runtime.http.clone());
+        let mut batches = adapter.stream_discovery(request.clone());
+        let mut count = 0usize;
+        while let Some(batch) = batches.recv().await {
+            let batch = batch?;
+            if !jobs.run_is_open(&payload.run.run_id).await? {
+                tracing::info!(
+                    run_id = payload.run.run_id,
+                    source = %request.source_id,
+                    "queued run was completed during discovery; stopping"
+                );
+                return Ok(count);
             }
-            return Ok(0);
+            let batch_count = batch.articles.len();
+            let Some(metrics) = jobs
+                .record_discovery_batch(&payload.run.run_id, &batch.id, batch_count)
+                .await?
+            else {
+                return Ok(count);
+            };
+            count = metrics.articles_discovered;
+            reporter.progress(metrics).await;
+            for article in batch.articles {
+                jobs.enqueue_article(FetchJob {
+                    request: request.clone(),
+                    article,
+                    run: payload.run.clone(),
+                })
+                .await?;
+            }
         }
-        reporter.progress(discovered).await;
-        for article in articles {
-            jobs.enqueue_article(FetchJob {
-                request: request.clone(),
-                article,
-                run: payload.run.clone(),
-            })
-            .await?;
+
+        if let Some(update) = jobs.finish_discovery(&payload.run.run_id).await?
+            && update.terminal
+        {
+            reporter
+                .completed(update.metrics, queued_duration_ms(payload.run.started_at))
+                .await;
         }
         tracing::info!(source = %request.source_id, count, "discovery job queued articles");
         Ok(count)

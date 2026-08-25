@@ -12,7 +12,7 @@ mod outbox;
 pub(crate) use forwarder::endpoint_url;
 pub use forwarder::{ArticleIngestionClient, DeliveryResult};
 pub use normalize::normalize;
-pub use outbox::{DeliveryStatus, Outbox, OutboxEntry};
+pub use outbox::{DeliveryStatus, Outbox, OutboxEntry, OutboxStats};
 
 use crate::{
     domain::{Article, ArticleDraft},

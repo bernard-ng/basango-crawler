@@ -189,7 +189,11 @@ impl SignalPublisher {
     }
 
     async fn publish(&self, signal: IngestionSignal) {
+        let is_heartbeat = matches!(&signal, IngestionSignal::AgentHeartbeat { .. });
         match serde_json::to_string(&signal) {
+            Ok(serialized) if is_heartbeat => {
+                tracing::debug!(signal = serialized, "ingestion heartbeat")
+            }
             Ok(serialized) => tracing::info!(signal = serialized, "ingestion signal"),
             Err(error) => tracing::warn!(%error, "could not serialize ingestion signal"),
         }

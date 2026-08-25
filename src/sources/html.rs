@@ -13,7 +13,7 @@ use crate::{
     domain::{ArticleDraft, CrawlRequest, PageRange},
     error::{CrawlError, Result},
     http::{HttpClient, consume_open_graph_html},
-    sources::{ArticleSeed, common},
+    sources::{ArticleSeed, DiscoveryBatch, common},
 };
 
 pub struct HtmlCrawler {
@@ -176,26 +176,58 @@ impl HtmlCrawler {
     }
 
     /// Discover detail URLs for the Redis-backed execution mode.
-    pub async fn discover(&self, request: &CrawlRequest) -> Result<Vec<ArticleSeed>> {
+    pub async fn discover_into(
+        &self,
+        request: &CrawlRequest,
+        sender: &mpsc::Sender<Result<DiscoveryBatch>>,
+    ) -> Result<()> {
         let page_range = match request.page_range {
             Some(range) => range,
             None => self.pagination(request.category.as_deref()).await?,
         };
-        let mut locations = Vec::new();
+        tracing::info!(
+            source = %self.source.common.id,
+            category = request.category.as_deref().unwrap_or("<none>"),
+            pages = %page_range,
+            "starting HTML discovery"
+        );
         let mut seen = HashSet::new();
+        let mut total_discovered = 0usize;
 
         for page in page_range.start..=page_range.end {
             let endpoint = self.endpoint_url(page, request.category.as_deref())?;
             let listing = self.fetch_text(&endpoint).await?;
-            for entry in self.listing_entries(&listing)? {
-                if let Some(url) = self.extract_link(&entry)?
+            let entries = self.listing_entries(&listing)?;
+            let mut articles = Vec::new();
+            for entry in &entries {
+                if let Some(url) = self.extract_link(entry)?
                     && seen.insert(url.clone())
                 {
-                    locations.push(ArticleSeed { url, data: None });
+                    articles.push(ArticleSeed { url, data: None });
                 }
             }
+            total_discovered += articles.len();
+            tracing::info!(
+                source = %self.source.common.id,
+                page,
+                last_page = page_range.end,
+                entries = entries.len(),
+                discovered = articles.len(),
+                total_discovered,
+                "HTML discovery page completed"
+            );
+            if sender
+                .send(Ok(DiscoveryBatch {
+                    id: format!("page:{page}"),
+                    articles,
+                }))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
         }
-        Ok(locations)
+        Ok(())
     }
 
     pub async fn collect(&self, url: &Url, request: &CrawlRequest) -> Result<ArticleDraft> {
