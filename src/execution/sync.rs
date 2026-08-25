@@ -29,6 +29,7 @@ pub struct CrawlReport {
 
 /// Run one source from listing discovery through article ingestion.
 pub async fn crawl_now(runtime: &Runtime, mut request: CrawlRequest) -> Result<CrawlReport> {
+    runtime.config.prepare_request(&mut request)?;
     let reporter = RunReporter::new(
         &runtime.config.ingestion,
         runtime.http.clone(),
@@ -268,11 +269,5 @@ fn elapsed_millis(started_at: Instant) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn summary_default_starts_at_zero() {
-        assert_eq!(CrawlReport::default().collected, 0);
-    }
-}
+#[path = "../../tests/unit/execution/sync.rs"]
+mod tests;

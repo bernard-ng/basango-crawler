@@ -116,6 +116,7 @@ fn html_source_schema() -> ObjectSchema {
         .field("pagination_template", non_blank_string())
         .field("selectors", selectors_schema())
         .optional_field("fetch_details", boolean())
+        .optional_field("indexed_categories", array(non_blank_string()).min(1))
         .strict()
 }
 

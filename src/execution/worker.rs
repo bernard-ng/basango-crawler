@@ -218,6 +218,7 @@ async fn process_discovery(
     final_attempt: bool,
 ) -> Result<usize> {
     let mut request = payload.request;
+    runtime.config.prepare_request(&mut request)?;
     let reporter = queued_run_reporter(runtime, &payload.run, &request.source_id);
     reporter.started().await;
     let result: Result<usize> = async {

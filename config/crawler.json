@@ -49,6 +49,15 @@
       "url": "https://7sur7.cd",
       "date_format": "yyyy-LL-dd'T'HH:mm:ssxx",
       "fetch_details": true,
+      "indexed_categories": [
+        "politique",
+        "economie",
+        "sante",
+        "culture",
+        "sport",
+        "societe",
+        "une"
+      ],
       "pagination_template": "index.php/category/{category}",
       "selectors": {
         "body": "div[property=\"schema:text\"].field.field--name-body",
@@ -63,13 +72,13 @@
       "kind": "html",
       "id": "mediacongo.net",
       "url": "https://www.mediacongo.net",
-      "date_format": "dd.MM.yyyy",
+      "date_format": "yyyy-LL-dd",
       "fetch_details": true,
       "pagination_template": "articles.html",
       "selectors": {
         "body": ".article_ttext",
         "categories": "a.color_link",
-        "date": ".article_other_about",
+        "date": "span[itemprop=\"datePublished\"]",
         "link": "a:first-child",
         "list": ".for_aitems > .article_other_item",
         "title": "h1",
@@ -80,15 +89,29 @@
       "kind": "html",
       "id": "actualite.cd",
       "url": "https://actualite.cd",
+      "date_format": "yyyy-LL-dd'T'HH:mm:ssxx",
       "fetch_details": true,
-      "pagination_template": "actualite",
+      "indexed_categories": [
+        "actualite/politique",
+        "actualite/securite",
+        "actualite/economie",
+        "actualite/societe",
+        "sport",
+        "culture",
+        "femme",
+        "justice",
+        "santé",
+        "afrique"
+      ],
+      "pagination_template": "category/{category}",
       "selectors": {
-        "body": ".views-field.views-field-body .field-content",
-        "categories": "#actu-cat",
+        "body": "[id$=\"-corps\"] > div",
+        "categories": "[id$=\"-categorie\"] a",
         "date": "head > meta[property=\"article:published_time\"]",
-        "link": "#actu-titre a",
-        "list": "#views-bootstrap-taxonomy-term-page-2 > div > div",
-        "title": "h1.page-title"
+        "link": ".post-link",
+        "list": ".grid.views-view-grid.row > .col-12.col-lg-4",
+        "title": "[id$=\"-page-title\"] h1",
+        "pagination": "nav.pager a"
       }
     },
     {

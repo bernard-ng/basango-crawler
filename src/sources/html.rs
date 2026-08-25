@@ -443,57 +443,5 @@ fn element_text(element: ElementRef<'_>) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::config::{CommonSourceConfig, HtmlSelectors};
-
-    use super::*;
-
-    fn source() -> HtmlSourceConfig {
-        HtmlSourceConfig {
-            common: CommonSourceConfig {
-                id: crate::domain::SourceId::new("example").unwrap(),
-                url: Url::parse("https://example.com").unwrap(),
-                ..CommonSourceConfig::default()
-            },
-            fetch_details: false,
-            pagination_template: "news/{page}".into(),
-            selectors: HtmlSelectors {
-                body: ".body".into(),
-                categories: Some(".category".into()),
-                date: "time".into(),
-                link: "a".into(),
-                list: ".article".into(),
-                title: "h1".into(),
-                pagination: ".pages a".into(),
-            },
-        }
-    }
-
-    #[test]
-    fn parses_an_html_article_without_network_access() {
-        let http = HttpClient::new(&Default::default()).unwrap();
-        let crawler = HtmlCrawler::new(source(), http);
-        let html = r#"
-            <html><head><meta property="og:title" content="Metadata title"></head>
-            <body><h1>Article title</h1><time datetime="2025-02-01T12:00:00Z"></time>
-            <div class="body"><p>Hello <strong>world</strong></p></div>
-            <span class="category">Politics</span></body></html>
-        "#;
-        let url = Url::parse("https://example.com/story").unwrap();
-        let article = crawler.parse_article(html, Some(&url), None).unwrap();
-        assert_eq!(article.title, "Article title");
-        assert!(article.body.contains("Hello"));
-        assert_eq!(article.categories, vec!["politics"]);
-    }
-
-    #[test]
-    fn substitutes_category_and_page_in_endpoint() {
-        let mut source = source();
-        source.pagination_template = "category/{category}/page/{page}".into();
-        let crawler = HtmlCrawler::new(source, HttpClient::new(&Default::default()).unwrap());
-        assert_eq!(
-            crawler.endpoint_url(3, Some("news")).unwrap().as_str(),
-            "https://example.com/category/news/page/3"
-        );
-    }
-}
+#[path = "../../tests/unit/sources/html.rs"]
+mod tests;

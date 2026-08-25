@@ -99,8 +99,8 @@ impl Crawler {
     }
 
     /// Schedule source discovery in BullMQ.
-    pub async fn schedule(&self, request: CrawlRequest) -> Result<String> {
-        self.runtime.config.source(&request.source_id)?;
+    pub async fn schedule(&self, mut request: CrawlRequest) -> Result<String> {
+        self.runtime.config.prepare_request(&mut request)?;
         let reporter = RunReporter::new(
             &self.runtime.config.ingestion,
             self.runtime.http.clone(),

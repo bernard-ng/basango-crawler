@@ -42,7 +42,7 @@ pub enum SourceAdapter {
 impl SourceAdapter {
     pub fn new(source: SourceConfig, http: HttpClient) -> Self {
         match source {
-            SourceConfig::Html(config) => Self::Html(html::HtmlCrawler::new(config, http)),
+            SourceConfig::Html(config) => Self::Html(html::HtmlCrawler::new(*config, http)),
             SourceConfig::WordPress(config) => {
                 Self::WordPress(wordpress::WordPressCrawler::new(config, http))
             }
