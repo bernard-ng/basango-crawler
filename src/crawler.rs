@@ -21,7 +21,6 @@ pub struct AgentResetReport {
     pub articles_queue: String,
     pub progress_trackers_removed: usize,
     pub outbox_articles_removed: usize,
-    pub legacy_queues_removed: bool,
 }
 
 /// A configured crawler with reusable HTTP connections.
@@ -116,15 +115,14 @@ impl Crawler {
     }
 
     /// Clear this agent's BullMQ state and local SQLite outbox.
-    pub async fn reset_agent(&self, include_legacy_queues: bool) -> Result<AgentResetReport> {
+    pub async fn reset_agent(&self) -> Result<AgentResetReport> {
         let queue = JobQueue::connect(&self.runtime.config.queue, &self.runtime.agent_id).await?;
         let QueueResetReport {
             agent_id,
             discovery_queue,
             articles_queue,
             progress_trackers_removed,
-            legacy_queues_removed,
-        } = queue.reset_agent(include_legacy_queues).await?;
+        } = queue.reset_agent().await?;
         let outbox = Outbox::open(&self.runtime.config.sqlite_path(), true)?;
         let outbox_articles_removed = outbox.clear()?;
         AgentReporter::new(
@@ -140,7 +138,6 @@ impl Crawler {
             articles_queue,
             progress_trackers_removed,
             outbox_articles_removed,
-            legacy_queues_removed,
         })
     }
 }

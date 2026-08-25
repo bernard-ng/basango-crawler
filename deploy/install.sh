@@ -7,8 +7,6 @@ SERVICE_USER=basango
 ENV_FILE="${INSTALL_DIR}/.env"
 BINARY_PATH="${INSTALL_DIR}/crawler"
 WORKER_UNIT=/etc/systemd/system/basango-crawler-worker.service
-SCHEDULE_UNIT=/etc/systemd/system/basango-crawler-schedule.service
-TIMER_UNIT=/etc/systemd/system/basango-crawler-schedule.timer
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -23,7 +21,7 @@ prompt_required() {
   local prompt=$1
   local value=
   while [[ -z ${value//[[:space:]]/} ]]; do
-    read -r -p "$prompt" value
+    read -r -p "$prompt" value </dev/tty || die "cannot read installer input from /dev/tty"
   done
   printf '%s' "$value"
 }
@@ -32,7 +30,7 @@ prompt_secret() {
   local prompt=$1
   local value=
   while [[ -z $value ]]; do
-    read -r -s -p "$prompt" value
+    read -r -s -p "$prompt" value </dev/tty || die "cannot read installer input from /dev/tty"
     printf '\n' >&2
   done
   printf '%s' "$value"
@@ -48,17 +46,16 @@ dotenv_value() {
 }
 
 write_initial_config() {
-  local agent_id api_endpoint api_token redis_url source_ids
+  local agent_id api_endpoint api_token redis_url
   agent_id=$(prompt_required 'Unique agent ID (example: basango-pi-01): ')
-  read -r -p 'Basango API base URL: ' api_endpoint
+  read -r -p 'Basango API base URL: ' api_endpoint </dev/tty || die "cannot read installer input from /dev/tty"
   if [[ -n $api_endpoint ]]; then
     api_token=$(prompt_secret 'Basango crawler API token: ')
   else
     api_token=
   fi
-  read -r -p 'Redis URL [redis://localhost:6379/0]: ' redis_url
+  read -r -p 'Redis URL [redis://localhost:6379/0]: ' redis_url </dev/tty || die "cannot read installer input from /dev/tty"
   redis_url=${redis_url:-redis://localhost:6379/0}
-  source_ids=$(prompt_required 'Comma-separated source IDs scheduled by this Pi: ')
 
   umask 027
   {
@@ -66,7 +63,6 @@ write_initial_config() {
     printf 'BASANGO_API_CRAWLER_ENDPOINT=%s\n' "$(dotenv_value "$api_endpoint")"
     printf 'BASANGO_API_CRAWLER_TOKEN=%s\n' "$(dotenv_value "$api_token")"
     printf 'BASANGO_CRAWLER_REDIS_URL=%s\n' "$(dotenv_value "$redis_url")"
-    printf 'BASANGO_CRAWLER_SOURCE_IDS=%s\n' "$(dotenv_value "$source_ids")"
     printf 'BASANGO_CRAWLER_SQLITE_PATH=%s\n' "$(dotenv_value "${STATE_DIR}/crawler.db")"
     printf 'RUST_LOG=info\n'
   } >"$ENV_FILE"
@@ -81,7 +77,7 @@ ensure_agent_id() {
   printf 'BASANGO_CRAWLER_AGENT_ID=%s\n' "$(dotenv_value "$agent_id")" >>"$ENV_FILE"
 }
 
-write_systemd_units() {
+write_worker_unit() {
   local unit_tmp
   unit_tmp=$(mktemp -d)
 
@@ -100,6 +96,8 @@ EnvironmentFile=/opt/crawler/.env
 ExecStart=/opt/crawler/crawler worker
 Restart=always
 RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=45
 UMask=0027
 NoNewPrivileges=true
 PrivateTmp=true
@@ -112,46 +110,7 @@ StateDirectory=crawler
 WantedBy=multi-user.target
 UNIT
 
-  cat >"${unit_tmp}/basango-crawler-schedule.service" <<'UNIT'
-[Unit]
-Description=Schedule Basango crawler jobs for this agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-User=basango
-Group=basango
-WorkingDirectory=/opt/crawler
-EnvironmentFile=/opt/crawler/.env
-ExecStart=/opt/crawler/crawler schedule
-UMask=0027
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/crawler
-StateDirectory=crawler
-UNIT
-
-  cat >"${unit_tmp}/basango-crawler-schedule.timer" <<'UNIT'
-[Unit]
-Description=Run the Basango crawler scheduler periodically
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=30min
-RandomizedDelaySec=5min
-Persistent=true
-Unit=basango-crawler-schedule.service
-
-[Install]
-WantedBy=timers.target
-UNIT
-
   install -m 0644 "${unit_tmp}/basango-crawler-worker.service" "$WORKER_UNIT"
-  install -m 0644 "${unit_tmp}/basango-crawler-schedule.service" "$SCHEDULE_UNIT"
-  install -m 0644 "${unit_tmp}/basango-crawler-schedule.timer" "$TIMER_UNIT"
   rm -rf "$unit_tmp"
 }
 
@@ -202,7 +161,7 @@ fi
 chown root:"$SERVICE_USER" "$ENV_FILE"
 chmod 0640 "$ENV_FILE"
 
-systemctl stop basango-crawler-schedule.timer basango-crawler-schedule.service basango-crawler-worker.service 2>/dev/null || true
+systemctl stop basango-crawler-worker.service 2>/dev/null || true
 backup_created=false
 if [[ -f $BINARY_PATH ]] && ! cmp -s "$candidate_binary" "$BINARY_PATH"; then
   cp -p "$BINARY_PATH" "${BINARY_PATH}.previous"
@@ -211,9 +170,9 @@ fi
 install -m 0755 -o root -g root "$candidate_binary" "${BINARY_PATH}.new"
 mv -f "${BINARY_PATH}.new" "$BINARY_PATH"
 
-write_systemd_units
+write_worker_unit
 systemctl daemon-reload
-systemctl enable basango-crawler-worker.service basango-crawler-schedule.timer >/dev/null
+systemctl enable basango-crawler-worker.service >/dev/null
 if ! systemctl restart basango-crawler-worker.service; then
   if [[ $backup_created == true && -f ${BINARY_PATH}.previous ]]; then
     printf 'Worker failed to start; restoring the previous binary.\n' >&2
@@ -222,7 +181,6 @@ if ! systemctl restart basango-crawler-worker.service; then
   fi
   die "crawler worker failed to start; inspect it with systemctl status basango-crawler-worker.service"
 fi
-systemctl restart basango-crawler-schedule.timer
 
 printf 'Installed %s to %s\n' "$("$BINARY_PATH" --version)" "$BINARY_PATH"
 printf 'Agent configuration: %s\n' "$ENV_FILE"

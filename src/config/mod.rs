@@ -37,7 +37,6 @@ pub use source::{
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CrawlerConfig {
-    #[serde(alias = "backend")]
     pub ingestion: IngestionApiConfig,
     pub http: HttpClientConfig,
     pub paths: PathsConfig,
@@ -119,23 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn former_backend_key_remains_a_configuration_alias() {
-        let config = loader::parse(
-            r#"{
-                "backend": { "endpoint": "https://api.example.com", "token": "secret" },
-                "sources": [{ "kind": "wordpress", "id": "example", "url": "https://example.com" }]
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            config.ingestion.endpoint.unwrap().as_str(),
-            "https://api.example.com/"
-        );
-    }
-
-    #[test]
-    fn typescript_wrapper_is_not_a_supported_configuration_shape() {
+    fn nested_configuration_wrapper_is_rejected() {
         let result = loader::parse(
             r#"{
                 "crawler": {

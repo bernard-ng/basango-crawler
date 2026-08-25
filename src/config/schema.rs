@@ -36,7 +36,6 @@ pub(super) fn validate(value: &Value) -> Result<()> {
 
 fn crawler_schema() -> ObjectSchema {
     object()
-        .optional_field("backend", ingestion_schema())
         .optional_field("ingestion", ingestion_schema())
         .optional_field("http", http_schema())
         .optional_field("paths", paths_schema())

@@ -45,7 +45,7 @@ enum Command {
     Deliver(DeliverArgs),
     /// Clear this agent's queues, run trackers, and SQLite outbox.
     #[command(alias = "reset")]
-    ResetAgent(ResetAgentArgs),
+    ResetAgent,
     /// Print version information (also available as --version).
     Version,
 }
@@ -111,13 +111,6 @@ struct DeliverArgs {
     retry_all: bool,
 }
 
-#[derive(Debug, Args)]
-struct ResetAgentArgs {
-    /// Also remove the former unscoped queues; use only during the one-time agent-prefix migration.
-    #[arg(long)]
-    include_legacy_queues: bool,
-}
-
 pub async fn run() -> anyhow::Result<()> {
     initialize_logging();
     let cli = Cli::parse();
@@ -160,8 +153,8 @@ pub async fn run() -> anyhow::Result<()> {
                 bail!("failed to deliver {} article(s)", report.failed);
             }
         }
-        Command::ResetAgent(arguments) => {
-            let report = crawler.reset_agent(arguments.include_legacy_queues).await?;
+        Command::ResetAgent => {
+            let report = crawler.reset_agent().await?;
             tracing::info!(?report, "agent state reset");
         }
         Command::Version => unreachable!("handled before configuration loading"),

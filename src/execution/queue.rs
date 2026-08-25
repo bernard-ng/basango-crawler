@@ -64,7 +64,6 @@ pub struct AgentResetReport {
     pub discovery_queue: String,
     pub articles_queue: String,
     pub progress_trackers_removed: usize,
-    pub legacy_queues_removed: bool,
 }
 
 /// Producer-side access to the two crawler queues.
@@ -416,20 +415,9 @@ impl JobQueue {
         Ok(runs)
     }
 
-    pub async fn reset_agent(&self, include_legacy_queues: bool) -> Result<AgentResetReport> {
+    pub async fn reset_agent(&self) -> Result<AgentResetReport> {
         self.discovery.obliterate(true, 1_000).await?;
         self.articles.obliterate(true, 1_000).await?;
-        if include_legacy_queues {
-            let options = queue_options(&self.config);
-            let (legacy_discovery, legacy_articles) = tokio::try_join!(
-                Queue::with_options(&self.config.queues.discovery, options.clone()),
-                Queue::with_options(&self.config.queues.articles, options),
-            )?;
-            tokio::try_join!(
-                legacy_discovery.obliterate(true, 1_000),
-                legacy_articles.obliterate(true, 1_000),
-            )?;
-        }
 
         let pattern = self.run_progress_pattern();
         let mut connection = self
@@ -465,7 +453,6 @@ impl JobQueue {
             discovery_queue: self.discovery_name.clone(),
             articles_queue: self.articles_name.clone(),
             progress_trackers_removed,
-            legacy_queues_removed: include_legacy_queues,
         })
     }
 
