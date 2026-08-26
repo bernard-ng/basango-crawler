@@ -5,7 +5,9 @@ use serde::Serialize;
 #[serde(rename_all = "camelCase")]
 pub struct RunMetrics {
     pub articles_discovered: usize,
+    pub articles_processed: usize,
     pub articles_persisted: usize,
+    pub articles_skipped: usize,
     pub articles_delivered: usize,
     pub articles_failed: usize,
 }

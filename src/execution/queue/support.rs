@@ -93,17 +93,19 @@ pub(super) fn parse_metric(value: &str) -> Result<usize> {
 }
 
 pub(super) fn metrics_from_values(values: &[i64]) -> Result<RunMetrics> {
-    if values.len() != 4 {
+    if values.len() != 6 {
         return Err(CrawlError::Queue(format!(
-            "expected 4 queued run metrics, received {}",
+            "expected 6 queued run metrics, received {}",
             values.len()
         )));
     }
     Ok(RunMetrics {
         articles_discovered: values[0].max(0) as usize,
-        articles_persisted: values[1].max(0) as usize,
-        articles_delivered: values[2].max(0) as usize,
-        articles_failed: values[3].max(0) as usize,
+        articles_processed: values[1].max(0) as usize,
+        articles_persisted: values[2].max(0) as usize,
+        articles_skipped: values[3].max(0) as usize,
+        articles_delivered: values[4].max(0) as usize,
+        articles_failed: values[5].max(0) as usize,
     })
 }
 
@@ -111,14 +113,14 @@ pub(super) fn queued_update_from_values(values: &[i64]) -> Result<Option<QueuedR
     if values.is_empty() {
         return Ok(None);
     }
-    if values.len() != 5 {
+    if values.len() != 7 {
         return Err(CrawlError::Queue(format!(
-            "expected 5 queued run update values, received {}",
+            "expected 7 queued run update values, received {}",
             values.len()
         )));
     }
     Ok(Some(QueuedRunUpdate {
-        metrics: metrics_from_values(&values[..4])?,
-        terminal: values[4] == 1,
+        metrics: metrics_from_values(&values[..6])?,
+        terminal: values[6] == 1,
     }))
 }

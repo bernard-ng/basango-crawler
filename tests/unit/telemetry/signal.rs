@@ -15,7 +15,9 @@ fn serializes_a_discriminated_progress_signal() {
         },
         metrics: RunMetrics {
             articles_discovered: 3,
+            articles_processed: 3,
             articles_persisted: 2,
+            articles_skipped: 1,
             articles_delivered: 1,
             articles_failed: 0,
         },
@@ -25,6 +27,8 @@ fn serializes_a_discriminated_progress_signal() {
     assert_eq!(value["type"], "run.progress");
     assert_eq!(value["signalId"], "signal-1");
     assert_eq!(value["metrics"]["articlesDelivered"], 1);
+    assert_eq!(value["metrics"]["articlesProcessed"], 3);
+    assert_eq!(value["metrics"]["articlesSkipped"], 1);
     assert!(value.get("event").is_none());
 }
 

@@ -51,3 +51,15 @@ fn queue_snapshot_preserves_all_job_counts() {
     assert_eq!(snapshot.waiting_children, 8);
     assert_eq!(snapshot.paused, 9);
 }
+
+#[test]
+fn queued_metrics_include_processed_and_skipped_counts() {
+    let metrics = metrics_from_values(&[10, 8, 6, 2, 5, 1]).unwrap();
+
+    assert_eq!(metrics.articles_discovered, 10);
+    assert_eq!(metrics.articles_processed, 8);
+    assert_eq!(metrics.articles_persisted, 6);
+    assert_eq!(metrics.articles_skipped, 2);
+    assert_eq!(metrics.articles_delivered, 5);
+    assert_eq!(metrics.articles_failed, 1);
+}

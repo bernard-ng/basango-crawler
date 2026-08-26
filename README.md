@@ -36,7 +36,7 @@ sudo systemctl status basango-crawler-worker.service
 sudo journalctl -fu basango-crawler-worker.service
 ```
 
-The worker starts automatically at boot. Stopping it gracefully completes open runs with their current metrics.
+The worker starts automatically at boot. Stopping it gracefully drains active work and leaves incomplete runs open so the next worker process can resume them. Repeated Redis connection failures make the process exit, allowing systemd to restart it without closing the affected runs.
 
 ### Schedule crawls
 
@@ -68,6 +68,15 @@ Show the current agent's Redis queues, open runs, and SQLite outbox:
 cd /opt/crawler
 sudo -u basango ./crawler status
 ```
+
+Audit the accounting fields for one active or recently completed run without changing Redis or queue state:
+
+```bash
+cd /opt/crawler
+sudo -u basango ./crawler reconcile-run --run-id RUN_ID
+```
+
+Current trackers report discovered, processed, persisted, skipped, and delivery counts separately. Older trackers remain readable, but missing legacy fields are reported as unknown rather than inferred.
 
 Manually retry pending article deliveries (normally the delivery queue handles these):
 

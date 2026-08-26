@@ -9,7 +9,7 @@ mod worker;
 
 pub(crate) use queue::{
     AgentResetReport as QueueResetReport, DeliveryJob, DiscoverJob, FetchJob, JobQueue,
-    QueueSnapshot, QueuedRunContext,
+    QueueSnapshot, QueuedArticleResult, QueuedRunContext, QueuedRunReconciliation,
 };
 pub use sync::CrawlReport;
 pub(crate) use sync::{crawl_now, forward_pending};

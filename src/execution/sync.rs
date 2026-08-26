@@ -257,7 +257,9 @@ impl From<&CrawlReport> for RunMetrics {
     fn from(report: &CrawlReport) -> Self {
         Self {
             articles_discovered: report.collected,
+            articles_processed: report.collected,
             articles_persisted: report.stored,
+            articles_skipped: 0,
             articles_delivered: report.delivered,
             articles_failed: report.failed,
         }

@@ -41,6 +41,15 @@ pub struct QueuedRunUpdate {
     pub terminal: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueuedArticleResult {
+    pub persisted: usize,
+    pub delivered: usize,
+    pub delivery_expected: usize,
+    pub failed: usize,
+    pub skipped: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenQueuedRun {
     pub run: QueuedRunContext,
@@ -49,6 +58,22 @@ pub struct OpenQueuedRun {
     pub deliveries_expected: usize,
     pub deliveries_processed: usize,
     pub metrics: RunMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedRunReconciliation {
+    pub run_id: String,
+    pub source_id: Option<String>,
+    pub discovery_complete: Option<bool>,
+    pub terminal: bool,
+    pub discovered: usize,
+    pub processed: Option<usize>,
+    pub persisted: usize,
+    pub skipped: Option<usize>,
+    pub failed: usize,
+    pub deliveries_expected: Option<usize>,
+    pub deliveries_processed: Option<usize>,
+    pub delivered: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

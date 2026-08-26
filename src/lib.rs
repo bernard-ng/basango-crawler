@@ -18,6 +18,7 @@ mod telemetry;
 pub use articles::{DeliveryStatus, Outbox, OutboxEntry, OutboxStats, normalize};
 pub use crawler::{
     AgentResetReport, Crawler, CrawlerStatus, OpenRunStatus, QueueStatus, RedisStatus,
+    RunReconciliation,
 };
 pub use domain::{
     AgentId, Article, ArticleDraft, ArticleHash, ArticleMetadata, CategorySlug, CrawlRequest,

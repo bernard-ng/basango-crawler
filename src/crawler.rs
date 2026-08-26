@@ -11,7 +11,7 @@ use crate::{
     error::Result,
     execution::{
         CrawlReport, DiscoverJob, JobQueue, QueueResetReport, QueueSnapshot, QueuedRunContext,
-        Runtime, crawl_now, forward_pending, run_worker,
+        QueuedRunReconciliation, Runtime, crawl_now, forward_pending, run_worker,
     },
     telemetry::{AgentReporter, RunMetrics, RunReporter},
 };
@@ -50,8 +50,25 @@ pub struct OpenRunStatus {
     pub deliveries_expected: usize,
     pub deliveries_processed: usize,
     pub persisted: usize,
+    pub skipped: usize,
     pub delivered: usize,
     pub failed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunReconciliation {
+    pub run_id: String,
+    pub source_id: Option<String>,
+    pub discovery_complete: Option<bool>,
+    pub terminal: bool,
+    pub discovered: usize,
+    pub processed: Option<usize>,
+    pub persisted: usize,
+    pub skipped: Option<usize>,
+    pub failed: usize,
+    pub deliveries_expected: Option<usize>,
+    pub deliveries_processed: Option<usize>,
+    pub delivered: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +204,7 @@ impl Crawler {
                         deliveries_expected: run.deliveries_expected,
                         deliveries_processed: run.deliveries_processed,
                         persisted: run.metrics.articles_persisted,
+                        skipped: run.metrics.articles_skipped,
                         delivered: run.metrics.articles_delivered,
                         failed: run.metrics.articles_failed,
                     })
@@ -202,6 +220,12 @@ impl Crawler {
             outbox,
             redis,
         }
+    }
+
+    /// Inspect a run tracker's accounting without mutating or requeueing work.
+    pub async fn reconcile_run(&self, run_id: &str) -> Result<RunReconciliation> {
+        let queue = JobQueue::connect(&self.runtime.config.queue, &self.runtime.agent_id).await?;
+        queue.reconcile_run(run_id).await.map(Into::into)
     }
 
     /// Clear this agent's BullMQ state and local SQLite outbox.
@@ -231,6 +255,25 @@ impl Crawler {
             progress_trackers_removed,
             outbox_articles_removed,
         })
+    }
+}
+
+impl From<QueuedRunReconciliation> for RunReconciliation {
+    fn from(value: QueuedRunReconciliation) -> Self {
+        Self {
+            run_id: value.run_id,
+            source_id: value.source_id,
+            discovery_complete: value.discovery_complete,
+            terminal: value.terminal,
+            discovered: value.discovered,
+            processed: value.processed,
+            persisted: value.persisted,
+            skipped: value.skipped,
+            failed: value.failed,
+            deliveries_expected: value.deliveries_expected,
+            deliveries_processed: value.deliveries_processed,
+            delivered: value.delivered,
+        }
     }
 }
 

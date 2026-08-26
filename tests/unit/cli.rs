@@ -29,3 +29,13 @@ fn status_is_a_standalone_command() {
     let cli = Cli::try_parse_from(["crawler", "status"]).unwrap();
     assert!(matches!(cli.command, Command::Status));
 }
+
+#[test]
+fn reconcile_run_requires_a_run_identifier() {
+    let cli = Cli::try_parse_from(["crawler", "reconcile-run", "--run-id", "run-1"]).unwrap();
+    let Command::ReconcileRun(arguments) = cli.command else {
+        panic!("expected reconcile-run command")
+    };
+
+    assert_eq!(arguments.run_id, "run-1");
+}

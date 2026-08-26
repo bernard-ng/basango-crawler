@@ -3,24 +3,27 @@
 mod delivery;
 mod discovery;
 
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use bullmq::worker::WorkerEvent;
 use bullmq::{Job, Worker, WorkerOptions};
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Duration, interval};
 
 use crate::{
     articles::{ArticleIngestionClient, DeliveryIntent, DeliveryStatus, Outbox, normalize},
     error::{CrawlError, Result},
-    execution::{DeliveryJob, DiscoverJob, FetchJob, JobQueue, Runtime},
+    execution::{DeliveryJob, DiscoverJob, FetchJob, JobQueue, QueuedArticleResult, Runtime},
     sources::SourceAdapter,
     telemetry::{AgentReporter, RunReporter},
 };
 
 use delivery::{enqueue_delivery_intent, process_delivery, reconcile_delivery_intents};
 use discovery::process_discovery;
+
+const REDIS_ERROR_RESTART_THRESHOLD: usize = 4;
+const REDIS_ERROR_WINDOW: Duration = Duration::from_secs(60);
 
 pub async fn run_worker(
     runtime: Runtime,
@@ -40,6 +43,7 @@ pub async fn run_worker(
     reconcile_delivery_intents(&jobs, &outbox).await?;
     let permits = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut workers = Vec::with_capacity(queue_names.len());
+    let (worker_error_sender, mut worker_error_receiver) = mpsc::unbounded_channel();
 
     for queue_name in &queue_names {
         let worker_runtime = runtime.clone();
@@ -68,9 +72,13 @@ pub async fn run_worker(
             // This value lets either queue use the full capacity while idle.
             .concurrency(concurrency.max(1));
         let worker = Arc::new(Worker::with_options(queue_name, processor, options).await?);
-        tokio::spawn(log_worker_events(worker.clone()));
+        tokio::spawn(log_worker_events(
+            worker.clone(),
+            worker_error_sender.clone(),
+        ));
         workers.push(worker);
     }
+    drop(worker_error_sender);
 
     let heartbeat_reporter = AgentReporter::new(
         &runtime.config.ingestion,
@@ -105,10 +113,42 @@ pub async fn run_worker(
         concurrency,
         "BullMQ crawler worker started"
     );
-    tokio::signal::ctrl_c().await.map_err(CrawlError::Io)?;
+    let mut redis_errors = VecDeque::new();
+    let fatal_error = loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(CrawlError::Io)?;
+                break None;
+            }
+            error = worker_error_receiver.recv() => {
+                let Some(error) = error else {
+                    break Some("all BullMQ event streams closed unexpectedly".to_owned());
+                };
+                let now = Instant::now();
+                redis_errors.push_back(now);
+                while redis_errors
+                    .front()
+                    .is_some_and(|occurred_at| now.duration_since(*occurred_at) > REDIS_ERROR_WINDOW)
+                {
+                    redis_errors.pop_front();
+                }
+                if redis_errors.len() >= REDIS_ERROR_RESTART_THRESHOLD {
+                    break Some(format!(
+                        "BullMQ Redis connection remained unhealthy after {} errors in {} seconds: {error}",
+                        redis_errors.len(),
+                        REDIS_ERROR_WINDOW.as_secs(),
+                    ));
+                }
+            }
+        }
+    };
     heartbeat_task.abort();
     reconciliation_task.abort();
-    tracing::info!("shutdown requested; draining BullMQ workers");
+    if let Some(error) = &fatal_error {
+        tracing::error!(%error, "worker restart requested; preserving queued run progress");
+    } else {
+        tracing::info!("shutdown requested; draining BullMQ workers");
+    }
     let mut close_error = None;
     for worker in &workers {
         if let Err(error) = worker.close(30_000).await {
@@ -116,32 +156,28 @@ pub async fn run_worker(
             close_error = Some(error);
         }
     }
-    let open_runs = jobs.complete_open_runs().await?;
-    for open_run in &open_runs {
-        queued_run_reporter(&runtime, &open_run.run, &open_run.source_id)
-            .completed(
-                open_run.metrics,
-                queued_duration_ms(open_run.run.started_at),
-            )
-            .await;
-    }
-    tracing::info!(
-        runs_completed = open_runs.len(),
-        "worker shutdown completed open queued runs"
-    );
+    tracing::info!("worker shutdown preserved open queued runs for the next worker");
     if let Some(error) = close_error {
         return Err(error.into());
+    }
+    if let Some(error) = fatal_error {
+        return Err(CrawlError::Queue(error));
     }
     Ok(())
 }
 
-async fn log_worker_events(worker: Arc<Worker>) {
+async fn log_worker_events(worker: Arc<Worker>, error_sender: mpsc::UnboundedSender<String>) {
     while let Some(event) = worker.next_event().await {
         match event {
             WorkerEvent::Failed { job_id, error } => {
                 tracing::error!(job_id, %error, "BullMQ job failed");
             }
-            WorkerEvent::Error(error) => tracing::error!(%error, "BullMQ worker error"),
+            WorkerEvent::Error(error) => {
+                tracing::error!(%error, "BullMQ worker error");
+                if is_redis_connection_error(&error) {
+                    let _ = error_sender.send(error);
+                }
+            }
             WorkerEvent::Stalled { job_id } => {
                 tracing::warn!(job_id, "BullMQ recovered a stalled job");
             }
@@ -152,6 +188,24 @@ async fn log_worker_events(worker: Arc<Worker>) {
             _ => {}
         }
     }
+}
+
+fn is_redis_connection_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("redis")
+        && [
+            "broken pipe",
+            "connection closed",
+            "connection is closed",
+            "connection refused",
+            "connection reset",
+            "network is unreachable",
+            "no route to host",
+            "timed out",
+            "unexpected eof",
+        ]
+        .iter()
+        .any(|fragment| error.contains(fragment))
 }
 
 async fn process_job(
@@ -215,9 +269,9 @@ async fn process_job(
                             jobs,
                             &payload,
                             &job_id,
-                            ArticleRunOutcome {
+                            QueuedArticleResult {
                                 failed: 1,
-                                ..ArticleRunOutcome::default()
+                                ..QueuedArticleResult::default()
                             },
                         )
                         .await?;
@@ -248,20 +302,12 @@ async fn process_job(
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct ArticleRunOutcome {
-    persisted: usize,
-    delivered: usize,
-    delivery_expected: usize,
-    failed: usize,
-}
-
 async fn process_article(
     runtime: &Runtime,
     jobs: &JobQueue,
     outbox: &Outbox,
     payload: &FetchJob,
-) -> Result<ArticleRunOutcome> {
+) -> Result<QueuedArticleResult> {
     let source = runtime.config.source(&payload.request.source_id)?;
     let mut adapter = SourceAdapter::new(source, runtime.http.clone());
     let draft = match adapter.collect(&payload.article, &payload.request).await {
@@ -269,11 +315,17 @@ async fn process_article(
         // These skips are deterministic and should count as successful jobs.
         Err(CrawlError::InvalidArticle(message)) => {
             tracing::info!(%message, url = %payload.article.url, "skipping invalid article");
-            return Ok(ArticleRunOutcome::default());
+            return Ok(QueuedArticleResult {
+                skipped: 1,
+                ..QueuedArticleResult::default()
+            });
         }
         Err(CrawlError::ArticleOutOfDateRange { .. }) => {
             tracing::info!(url = %payload.article.url, "skipping out-of-range article");
-            return Ok(ArticleRunOutcome::default());
+            return Ok(QueuedArticleResult {
+                skipped: 1,
+                ..QueuedArticleResult::default()
+            });
         }
         Err(error) => return Err(error),
     };
@@ -290,26 +342,27 @@ async fn process_article(
     Ok(match status {
         DeliveryStatus::Forwarded => {
             if outbox.has_delivery_intent(&payload.run.run_id, article.hash.as_str())? {
-                ArticleRunOutcome {
+                QueuedArticleResult {
                     persisted: 1,
                     delivery_expected: 1,
-                    ..ArticleRunOutcome::default()
+                    ..QueuedArticleResult::default()
                 }
             } else {
-                ArticleRunOutcome {
+                QueuedArticleResult {
                     persisted: 1,
                     delivered: 1,
                     failed: 0,
                     delivery_expected: 0,
+                    skipped: 0,
                 }
             }
         }
         DeliveryStatus::Pending | DeliveryStatus::Failed => {
             enqueue_delivery_intent(jobs, outbox, &intent).await?;
-            ArticleRunOutcome {
+            QueuedArticleResult {
                 persisted: 1,
                 delivery_expected: 1,
-                ..ArticleRunOutcome::default()
+                ..QueuedArticleResult::default()
             }
         }
     })
@@ -320,17 +373,10 @@ async fn report_article_result(
     jobs: &JobQueue,
     payload: &FetchJob,
     job_id: &str,
-    outcome: ArticleRunOutcome,
+    outcome: QueuedArticleResult,
 ) -> bullmq::Result<()> {
     let update = jobs
-        .record_article_result(
-            &payload.run.run_id,
-            job_id,
-            outcome.persisted,
-            outcome.delivered,
-            outcome.delivery_expected,
-            outcome.failed,
-        )
+        .record_article_result(&payload.run.run_id, job_id, outcome)
         .await
         .map_err(processing_error)?;
     let Some(update) = update else {
@@ -369,4 +415,19 @@ pub(super) fn queued_duration_ms(started_at: chrono::DateTime<chrono::Utc>) -> u
 
 pub(super) fn processing_error(error: CrawlError) -> bullmq::Error {
     bullmq::Error::ProcessingError(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_redis_connection_error;
+
+    #[test]
+    fn classifies_transient_redis_connection_errors() {
+        assert!(is_redis_connection_error("redis error: broken pipe"));
+        assert!(is_redis_connection_error(
+            "Redis error: connection reset by peer"
+        ));
+        assert!(!is_redis_connection_error("redis error: WRONGTYPE"));
+        assert!(!is_redis_connection_error("HTTP request timed out"));
+    }
 }

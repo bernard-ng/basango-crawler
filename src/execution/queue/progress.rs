@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 use crate::{domain::SourceId, error::Result, telemetry::RunMetrics};
 
 use super::{
-    AgentResetReport, JobQueue, OpenQueuedRun, QueueSnapshot, QueuedRunContext, QueuedRunUpdate,
-    RUN_PROGRESS_TTL_SECONDS,
+    AgentResetReport, JobQueue, OpenQueuedRun, QueueSnapshot, QueuedArticleResult,
+    QueuedRunContext, QueuedRunReconciliation, QueuedRunUpdate, RUN_PROGRESS_TTL_SECONDS,
     support::{metrics_from_values, parse_metric, queue_snapshot, queued_update_from_values},
 };
 
@@ -21,6 +21,7 @@ impl JobQueue {
                     'deliveryExpected', 0,
                     'deliveryProcessed', 0,
                     'persisted', 0,
+                    'skipped', 0,
                     'delivered', 0,
                     'failed', 0,
                     'terminalSent', 0)
@@ -65,7 +66,10 @@ impl JobQueue {
             redis.call('EXPIRE', KEYS[1], ARGV[2])
             return {
                 tonumber(redis.call('HGET', KEYS[1], 'discovered')) or 0,
+                tonumber(redis.call('HGET', KEYS[1], 'articleProcessed')
+                    or redis.call('HGET', KEYS[1], 'processed')) or 0,
                 tonumber(redis.call('HGET', KEYS[1], 'persisted')) or 0,
+                tonumber(redis.call('HGET', KEYS[1], 'skipped')) or 0,
                 tonumber(redis.call('HGET', KEYS[1], 'delivered')) or 0,
                 tonumber(redis.call('HGET', KEYS[1], 'failed')) or 0
             }
@@ -95,18 +99,21 @@ impl JobQueue {
             if tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 1 then return {} end
             redis.call('HSET', KEYS[1], 'discoveryComplete', 1)
             local discovered = tonumber(redis.call('HGET', KEYS[1], 'discovered')) or 0
-            local articleProcessed = tonumber(redis.call('HGET', KEYS[1], 'articleProcessed')) or 0
+            local articleProcessed = tonumber(redis.call('HGET', KEYS[1], 'articleProcessed')
+                or redis.call('HGET', KEYS[1], 'processed')) or 0
             local deliveryExpected = tonumber(redis.call('HGET', KEYS[1], 'deliveryExpected')) or 0
             local deliveryProcessed = tonumber(redis.call('HGET', KEYS[1], 'deliveryProcessed')) or 0
             local terminal = 0
-            if articleProcessed >= discovered and deliveryProcessed >= deliveryExpected then
+            if articleProcessed == discovered and deliveryProcessed == deliveryExpected then
                 redis.call('HSET', KEYS[1], 'terminalSent', 1)
                 terminal = 1
             end
             redis.call('EXPIRE', KEYS[1], ARGV[1])
             return {
                 discovered,
+                articleProcessed,
                 tonumber(redis.call('HGET', KEYS[1], 'persisted')) or 0,
+                tonumber(redis.call('HGET', KEYS[1], 'skipped')) or 0,
                 tonumber(redis.call('HGET', KEYS[1], 'delivered')) or 0,
                 tonumber(redis.call('HGET', KEYS[1], 'failed')) or 0,
                 terminal
@@ -147,32 +154,34 @@ impl JobQueue {
         &self,
         run_id: &str,
         job_id: &str,
-        persisted: usize,
-        delivered: usize,
-        delivery_expected: usize,
-        failed: usize,
+        result: QueuedArticleResult,
     ) -> Result<Option<QueuedRunUpdate>> {
         const SCRIPT: &str = r#"
             if redis.call('EXISTS', KEYS[1]) == 0 then return {} end
             if tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 1 then return {} end
             if redis.call('HSETNX', KEYS[1], 'job:' .. ARGV[1], 1) == 0 then return {} end
+            if redis.call('HEXISTS', KEYS[1], 'articleProcessed') == 0 then
+                redis.call('HSET', KEYS[1], 'articleProcessed',
+                    tonumber(redis.call('HGET', KEYS[1], 'processed')) or 0)
+            end
             local articleProcessed = redis.call('HINCRBY', KEYS[1], 'articleProcessed', 1)
             local persisted = redis.call('HINCRBY', KEYS[1], 'persisted', ARGV[2])
             local delivered = redis.call('HINCRBY', KEYS[1], 'delivered', ARGV[3])
             local deliveryExpected = redis.call('HINCRBY', KEYS[1], 'deliveryExpected', ARGV[4])
             local failed = redis.call('HINCRBY', KEYS[1], 'failed', ARGV[5])
+            local skipped = redis.call('HINCRBY', KEYS[1], 'skipped', ARGV[6])
             local discovered = tonumber(redis.call('HGET', KEYS[1], 'discovered')) or 0
             local deliveryProcessed = tonumber(redis.call('HGET', KEYS[1], 'deliveryProcessed')) or 0
             local terminal = 0
             if tonumber(redis.call('HGET', KEYS[1], 'discoveryComplete')) == 1
-                and articleProcessed >= discovered
-                and deliveryProcessed >= deliveryExpected
+                and articleProcessed == discovered
+                and deliveryProcessed == deliveryExpected
                 and tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 0 then
                 redis.call('HSET', KEYS[1], 'terminalSent', 1)
                 terminal = 1
             end
-            redis.call('EXPIRE', KEYS[1], ARGV[6])
-            return {discovered, persisted, delivered, failed, terminal}
+            redis.call('EXPIRE', KEYS[1], ARGV[7])
+            return {discovered, articleProcessed, persisted, skipped, delivered, failed, terminal}
         "#;
         let key = self.run_progress_key(run_id);
         let mut connection = self
@@ -182,10 +191,11 @@ impl JobQueue {
         let values: Vec<i64> = redis::Script::new(SCRIPT)
             .key(key)
             .arg(job_id)
-            .arg(persisted)
-            .arg(delivered)
-            .arg(delivery_expected)
-            .arg(failed)
+            .arg(result.persisted)
+            .arg(result.delivered)
+            .arg(result.delivery_expected)
+            .arg(result.failed)
+            .arg(result.skipped)
             .arg(RUN_PROGRESS_TTL_SECONDS)
             .invoke_async(&mut connection)
             .await?;
@@ -207,18 +217,21 @@ impl JobQueue {
             local delivered = redis.call('HINCRBY', KEYS[1], 'delivered', ARGV[2])
             local failed = redis.call('HINCRBY', KEYS[1], 'failed', ARGV[3])
             local discovered = tonumber(redis.call('HGET', KEYS[1], 'discovered')) or 0
-            local articleProcessed = tonumber(redis.call('HGET', KEYS[1], 'articleProcessed')) or 0
+            local articleProcessed = tonumber(redis.call('HGET', KEYS[1], 'articleProcessed')
+                or redis.call('HGET', KEYS[1], 'processed')) or 0
             local deliveryExpected = tonumber(redis.call('HGET', KEYS[1], 'deliveryExpected')) or 0
             local terminal = 0
             if tonumber(redis.call('HGET', KEYS[1], 'discoveryComplete')) == 1
-                and articleProcessed >= discovered
-                and deliveryProcessed >= deliveryExpected
+                and articleProcessed == discovered
+                and deliveryProcessed == deliveryExpected
                 and tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 0 then
                 redis.call('HSET', KEYS[1], 'terminalSent', 1)
                 terminal = 1
             end
             redis.call('EXPIRE', KEYS[1], ARGV[4])
-            return {discovered, tonumber(redis.call('HGET', KEYS[1], 'persisted')) or 0,
+            return {discovered, articleProcessed,
+                tonumber(redis.call('HGET', KEYS[1], 'persisted')) or 0,
+                tonumber(redis.call('HGET', KEYS[1], 'skipped')) or 0,
                 delivered, failed, terminal}
         "#;
         let key = self.run_progress_key(run_id);
@@ -276,16 +289,18 @@ impl JobQueue {
                         "startedAt",
                         "discovered",
                         "articleProcessed",
+                        "processed",
                         "deliveryExpected",
                         "deliveryProcessed",
                         "persisted",
+                        "skipped",
                         "delivered",
                         "failed",
                         "terminalSent",
                     ])
                     .query_async(&mut connection)
                     .await?;
-                if values.len() != 10 || values[9].as_deref() == Some("1") {
+                if values.len() != 12 || values[11].as_deref() == Some("1") {
                     continue;
                 }
                 let Some(run_id) = key.rsplit(':').next() else {
@@ -306,11 +321,21 @@ impl JobQueue {
                 };
                 let metrics = [
                     parse_metric(values[2].as_deref().unwrap_or("0")),
-                    parse_metric(values[6].as_deref().unwrap_or("0")),
+                    parse_metric(values[3].as_deref().or(values[4].as_deref()).unwrap_or("0")),
                     parse_metric(values[7].as_deref().unwrap_or("0")),
                     parse_metric(values[8].as_deref().unwrap_or("0")),
+                    parse_metric(values[9].as_deref().unwrap_or("0")),
+                    parse_metric(values[10].as_deref().unwrap_or("0")),
                 ];
-                let [Ok(discovered), Ok(persisted), Ok(delivered), Ok(failed)] = metrics else {
+                let [
+                    Ok(discovered),
+                    Ok(processed),
+                    Ok(persisted),
+                    Ok(skipped),
+                    Ok(delivered),
+                    Ok(failed),
+                ] = metrics
+                else {
                     tracing::warn!(run_id, "skipping queued run tracker with invalid metrics");
                     continue;
                 };
@@ -321,12 +346,14 @@ impl JobQueue {
                         started_at: started_at.with_timezone(&Utc),
                     },
                     source_id,
-                    articles_processed: parse_metric(values[3].as_deref().unwrap_or("0"))?,
-                    deliveries_expected: parse_metric(values[4].as_deref().unwrap_or("0"))?,
-                    deliveries_processed: parse_metric(values[5].as_deref().unwrap_or("0"))?,
+                    articles_processed: processed,
+                    deliveries_expected: parse_metric(values[5].as_deref().unwrap_or("0"))?,
+                    deliveries_processed: parse_metric(values[6].as_deref().unwrap_or("0"))?,
                     metrics: RunMetrics {
                         articles_discovered: discovered,
+                        articles_processed: processed,
                         articles_persisted: persisted,
+                        articles_skipped: skipped,
                         articles_delivered: delivered,
                         articles_failed: failed,
                     },
@@ -340,15 +367,60 @@ impl JobQueue {
         Ok(runs)
     }
 
-    pub async fn complete_open_runs(&self) -> Result<Vec<OpenQueuedRun>> {
-        let mut completed = Vec::new();
-        for mut open_run in self.open_runs().await? {
-            if let Some(metrics) = self.close_run(&open_run.run.run_id).await? {
-                open_run.metrics = metrics;
-                completed.push(open_run);
-            }
+    pub async fn reconcile_run(&self, run_id: &str) -> Result<QueuedRunReconciliation> {
+        let key = self.run_progress_key(run_id);
+        let mut connection = self
+            .progress_client
+            .get_multiplexed_async_connection()
+            .await?;
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await?;
+        if !exists {
+            return Err(crate::error::CrawlError::Queue(format!(
+                "run tracker '{run_id}' was not found or has expired"
+            )));
         }
-        Ok(completed)
+
+        let values: Vec<Option<String>> = redis::cmd("HMGET")
+            .arg(&key)
+            .arg(&[
+                "sourceId",
+                "discoveryComplete",
+                "terminalSent",
+                "discovered",
+                "articleProcessed",
+                "processed",
+                "persisted",
+                "skipped",
+                "failed",
+                "deliveryExpected",
+                "deliveryProcessed",
+                "delivered",
+            ])
+            .query_async(&mut connection)
+            .await?;
+        if values.len() != 12 {
+            return Err(crate::error::CrawlError::Queue(format!(
+                "run tracker '{run_id}' returned an invalid reconciliation record"
+            )));
+        }
+
+        Ok(QueuedRunReconciliation {
+            run_id: run_id.to_owned(),
+            source_id: values[0].clone(),
+            discovery_complete: parse_optional_flag(values[1].as_deref())?,
+            terminal: parse_optional_flag(values[2].as_deref())?.unwrap_or(false),
+            discovered: parse_metric(values[3].as_deref().unwrap_or("0"))?,
+            processed: parse_optional_metric(values[4].as_deref().or(values[5].as_deref()))?,
+            persisted: parse_metric(values[6].as_deref().unwrap_or("0"))?,
+            skipped: parse_optional_metric(values[7].as_deref())?,
+            failed: parse_metric(values[8].as_deref().unwrap_or("0"))?,
+            deliveries_expected: parse_optional_metric(values[9].as_deref())?,
+            deliveries_processed: parse_optional_metric(values[10].as_deref())?,
+            delivered: parse_metric(values[11].as_deref().unwrap_or("0"))?,
+        })
     }
 
     pub async fn reset_agent(&self) -> Result<AgentResetReport> {
@@ -416,7 +488,10 @@ impl JobQueue {
             redis.call('EXPIRE', KEYS[1], ARGV[1])
             return {
                 tonumber(redis.call('HGET', KEYS[1], 'discovered')) or 0,
+                tonumber(redis.call('HGET', KEYS[1], 'articleProcessed')
+                    or redis.call('HGET', KEYS[1], 'processed')) or 0,
                 tonumber(redis.call('HGET', KEYS[1], 'persisted')) or 0,
+                tonumber(redis.call('HGET', KEYS[1], 'skipped')) or 0,
                 tonumber(redis.call('HGET', KEYS[1], 'delivered')) or 0,
                 tonumber(redis.call('HGET', KEYS[1], 'failed')) or 0
             }
@@ -431,14 +506,26 @@ impl JobQueue {
             .arg(RUN_PROGRESS_TTL_SECONDS)
             .invoke_async(&mut connection)
             .await?;
-        if values.len() != 4 {
+        if values.len() != 6 {
             return Ok(None);
         }
-        Ok(Some(RunMetrics {
-            articles_discovered: values[0].max(0) as usize,
-            articles_persisted: values[1].max(0) as usize,
-            articles_delivered: values[2].max(0) as usize,
-            articles_failed: values[3].max(0) as usize,
-        }))
+        Ok(Some(metrics_from_values(&values)?))
+    }
+}
+
+fn parse_optional_metric(value: Option<&str>) -> Result<Option<usize>> {
+    value.map(parse_metric).transpose()
+}
+
+fn parse_optional_flag(value: Option<&str>) -> Result<Option<bool>> {
+    let Some(value) = parse_optional_metric(value)? else {
+        return Ok(None);
+    };
+    match value {
+        0 => Ok(Some(false)),
+        1 => Ok(Some(true)),
+        value => Err(crate::error::CrawlError::Queue(format!(
+            "invalid queued run flag '{value}' in Redis progress tracker"
+        ))),
     }
 }

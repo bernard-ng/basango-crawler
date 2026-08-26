@@ -18,7 +18,7 @@ use crate::{
 
 pub use model::{
     AgentResetReport, DeliveryJob, DiscoverJob, FetchJob, OpenQueuedRun, QueueSnapshot,
-    QueuedRunContext, QueuedRunUpdate,
+    QueuedArticleResult, QueuedRunContext, QueuedRunReconciliation, QueuedRunUpdate,
 };
 pub(crate) use support::redis_options;
 use support::{encode_agent_id, queue_options, retention, scoped_queue_name, stable_job_id};
@@ -174,7 +174,7 @@ impl JobQueue {
 #[cfg(test)]
 use bullmq::types::{JobCounts, RemoveOnFinish};
 #[cfg(test)]
-use support::snapshot_from_counts;
+use support::{metrics_from_values, snapshot_from_counts};
 
 #[cfg(test)]
 #[path = "../../../tests/unit/execution/queue.rs"]

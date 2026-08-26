@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    Crawler, CrawlerStatus,
+    Crawler, CrawlerStatus, RunReconciliation,
     domain::{CrawlRequest, DateRange, PageRange, SourceId, UpdateDirection},
     error::CrawlError,
 };
@@ -45,6 +45,8 @@ enum Command {
     Deliver(DeliverArgs),
     /// Show this agent's Redis queues, open runs, and SQLite outbox state.
     Status,
+    /// Audit one Redis run tracker without changing queue state.
+    ReconcileRun(ReconcileRunArgs),
     /// Clear this agent's queues, run trackers, and SQLite outbox.
     #[command(alias = "reset")]
     ResetAgent,
@@ -113,6 +115,13 @@ struct DeliverArgs {
     retry_all: bool,
 }
 
+#[derive(Debug, Args)]
+struct ReconcileRunArgs {
+    /// Run identifier shown by the ingestion dashboard or crawler status.
+    #[arg(long)]
+    run_id: String,
+}
+
 pub async fn run() -> anyhow::Result<()> {
     initialize_logging();
     let cli = Cli::parse();
@@ -156,6 +165,10 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         Command::Status => print_status(&crawler.status().await),
+        Command::ReconcileRun(arguments) => {
+            let reconciliation = crawler.reconcile_run(&arguments.run_id).await?;
+            print_run_reconciliation(&reconciliation);
+        }
         Command::ResetAgent => {
             let report = crawler.reset_agent().await?;
             tracing::info!(?report, "agent state reset");
@@ -220,8 +233,13 @@ fn print_status(status: &CrawlerStatus) {
                     run.started_at.to_rfc3339()
                 );
                 println!(
-                    "      discovered {} | processed {} | persisted {} | delivered {} | failed {}",
-                    run.discovered, run.processed, run.persisted, run.delivered, run.failed
+                    "      discovered {} | processed {} | persisted {} | skipped {} | delivered {} | failed {}",
+                    run.discovered,
+                    run.processed,
+                    run.persisted,
+                    run.skipped,
+                    run.delivered,
+                    run.failed
                 );
                 println!(
                     "      delivery jobs {} expected | {} processed",
@@ -231,6 +249,82 @@ fn print_status(status: &CrawlerStatus) {
         }
         Err(error) => println!("  State:  unavailable ({error})"),
     }
+}
+
+fn print_run_reconciliation(run: &RunReconciliation) {
+    println!("Run reconciliation");
+    println!("  Run:       {}", run.run_id);
+    println!(
+        "  Source:    {}",
+        run.source_id.as_deref().unwrap_or("<unknown>")
+    );
+    println!(
+        "  State:     {}",
+        if run.terminal { "terminal" } else { "open" }
+    );
+    println!(
+        "  Discovery: {}",
+        match run.discovery_complete {
+            Some(true) => "complete",
+            Some(false) => "running",
+            None => "unknown (legacy tracker)",
+        }
+    );
+    println!("  Discovered: {}", run.discovered);
+    println!("  Processed:  {}", optional_metric(run.processed));
+    println!("  Persisted:  {}", run.persisted);
+    println!("  Skipped:    {}", optional_metric(run.skipped));
+    println!("  Failed:     {}", run.failed);
+    println!("  Delivered:  {}", run.delivered);
+
+    let gap = run.discovered.saturating_sub(run.persisted);
+    println!();
+    println!("Accounting");
+    println!("  Discovery-to-persistence gap: {gap}");
+    match run.processed {
+        Some(processed) => {
+            let remaining = run.discovered.saturating_sub(processed);
+            println!("  Not processed:                {remaining}");
+            match run.skipped {
+                Some(skipped) => {
+                    let other_non_persisted = processed
+                        .saturating_sub(run.persisted)
+                        .saturating_sub(skipped);
+                    println!("  Explicitly skipped:           {skipped}");
+                    println!("  Other non-persisted results:  {other_non_persisted}");
+                }
+                None => {
+                    println!(
+                        "  Processed but not persisted:  {}",
+                        processed.saturating_sub(run.persisted)
+                    );
+                    println!("  Explicit skip count:          unknown (legacy tracker)");
+                }
+            }
+            if run.terminal && remaining > 0 {
+                println!();
+                println!(
+                    "  INCONSISTENT: this run is terminal but {remaining} discovered article(s) were never processed"
+                );
+            }
+        }
+        None => {
+            println!(
+                "  Legacy tracker: processed fields are unavailable, so the gap cannot be split exactly"
+            );
+        }
+    }
+
+    println!();
+    println!("Delivery jobs");
+    println!("  Expected:  {}", optional_metric(run.deliveries_expected));
+    println!("  Processed: {}", optional_metric(run.deliveries_processed));
+}
+
+fn optional_metric(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown (legacy tracker)".to_owned())
 }
 
 async fn schedule(crawler: &Crawler, arguments: ScheduleArgs) -> anyhow::Result<()> {
