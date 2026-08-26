@@ -51,7 +51,10 @@ pub(super) async fn process_discovery(
                 return Ok(count);
             };
             count = metrics.articles_discovered;
-            reporter.progress(metrics).await;
+
+            if jobs.claim_progress_publication(&payload.run.run_id).await? {
+                reporter.progress(metrics).await;
+            }
         }
 
         if let Some(update) = jobs.finish_discovery(&payload.run.run_id).await?

@@ -1,4 +1,8 @@
-use std::env;
+use std::{
+    env,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use chrono::Utc;
 use uuid::Uuid;
@@ -11,6 +15,8 @@ use crate::{
 };
 
 use super::RunMetrics;
+
+const PROGRESS_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Telemetry available to a long-lived worker agent.
 #[derive(Clone)]
@@ -48,6 +54,7 @@ impl AgentReporter {
 #[derive(Clone)]
 pub struct RunReporter {
     publisher: SignalPublisher,
+    progress_published_at: Arc<Mutex<Option<Instant>>>,
     run_id: String,
     source_id: String,
 }
@@ -79,6 +86,7 @@ impl RunReporter {
         publisher.agent_id = agent_id;
         Self {
             publisher,
+            progress_published_at: Arc::new(Mutex::new(None)),
             run_id,
             source_id,
         }
@@ -113,6 +121,10 @@ impl RunReporter {
     }
 
     pub async fn progress(&self, metrics: RunMetrics) {
+        if !self.progress_is_due() {
+            return;
+        }
+
         self.publisher
             .publish(IngestionSignal::RunProgress {
                 context: self.context(),
@@ -151,6 +163,21 @@ impl RunReporter {
             run_id: self.run_id.clone(),
             source_id: self.source_id.clone(),
         }
+    }
+
+    fn progress_is_due(&self) -> bool {
+        let now = Instant::now();
+        let mut published_at = self
+            .progress_published_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if published_at.is_some_and(|last| now.duration_since(last) < PROGRESS_PUBLISH_INTERVAL) {
+            return false;
+        }
+
+        *published_at = Some(now);
+        true
     }
 }
 

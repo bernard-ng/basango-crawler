@@ -24,6 +24,7 @@ pub(crate) use support::redis_options;
 use support::{encode_agent_id, queue_options, retention, scoped_queue_name, stable_job_id};
 
 const JOB_ATTEMPTS: u32 = 3;
+const PROGRESS_PUBLISH_INTERVAL_MS: usize = 1_000;
 const RETRY_DELAY_MS: u64 = 1_000;
 const RUN_PROGRESS_TTL_SECONDS: usize = 7 * 24 * 60 * 60;
 

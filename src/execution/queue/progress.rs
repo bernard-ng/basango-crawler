@@ -3,12 +3,34 @@ use chrono::{DateTime, Utc};
 use crate::{domain::SourceId, error::Result, telemetry::RunMetrics};
 
 use super::{
-    AgentResetReport, JobQueue, OpenQueuedRun, QueueSnapshot, QueuedArticleResult,
-    QueuedRunContext, QueuedRunReconciliation, QueuedRunUpdate, RUN_PROGRESS_TTL_SECONDS,
+    AgentResetReport, JobQueue, OpenQueuedRun, PROGRESS_PUBLISH_INTERVAL_MS, QueueSnapshot,
+    QueuedArticleResult, QueuedRunContext, QueuedRunReconciliation, QueuedRunUpdate,
+    RUN_PROGRESS_TTL_SECONDS,
     support::{metrics_from_values, parse_metric, queue_snapshot, queued_update_from_values},
 };
 
 impl JobQueue {
+    pub async fn claim_progress_publication(&self, run_id: &str) -> Result<bool> {
+        let key = format!(
+            "{}:telemetry:{}:progress-publication:{run_id}",
+            self.config.prefix, self.agent_scope
+        );
+        let mut connection = self
+            .progress_client
+            .get_multiplexed_async_connection()
+            .await?;
+        let acquired: Option<String> = redis::cmd("SET")
+            .arg(key)
+            .arg(1)
+            .arg("NX")
+            .arg("PX")
+            .arg(PROGRESS_PUBLISH_INTERVAL_MS)
+            .query_async(&mut connection)
+            .await?;
+
+        Ok(acquired.is_some())
+    }
+
     pub async fn prepare_run(&self, run: &QueuedRunContext, source_id: &SourceId) -> Result<()> {
         const SCRIPT: &str = r#"
             if redis.call('EXISTS', KEYS[1]) == 0 then

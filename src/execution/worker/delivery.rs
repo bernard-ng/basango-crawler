@@ -89,12 +89,19 @@ async fn finish_delivery(
         return Ok(());
     };
     let reporter = queued_run_reporter(runtime, &payload.run, &payload.source_id);
-    reporter.progress(update.metrics).await;
+
     if update.terminal {
         reporter
             .completed(update.metrics, queued_duration_ms(payload.run.started_at))
             .await;
+    } else if jobs
+        .claim_progress_publication(&payload.run.run_id)
+        .await
+        .map_err(processing_error)?
+    {
+        reporter.progress(update.metrics).await;
     }
+
     Ok(())
 }
 
