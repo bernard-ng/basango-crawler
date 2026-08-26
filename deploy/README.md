@@ -35,7 +35,7 @@ You can also omit the argument and answer the URL prompt, or set `BASANGO_CRAWLE
 
 Pushing a `v*` Git tag runs the release workflow, which publishes native `aarch64` (Raspberry Pi) and `x86_64` Linux archives to the GitHub release.
 
-Each agent ID prefixes its BullMQ queue names, so multiple Pis can safely share Redis. The installer does not schedule crawls. Run `crawler schedule` yourself or configure cron later with the sources and cadence assigned to that device.
+Each agent ID prefixes its discovery, article, and delivery queue names, so multiple Pis can safely share Redis. The worker consumes all three concurrently and reconciles SQLite delivery records after a restart. The installer does not schedule crawls. Run `crawler schedule` yourself or configure cron later with the sources and cadence assigned to that device.
 
 To reset a Pi, stop its worker before clearing its scoped queues and SQLite outbox:
 

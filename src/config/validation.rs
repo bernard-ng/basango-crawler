@@ -7,9 +7,17 @@ use super::{CrawlerConfig, SourceConfig, schema};
 pub(super) fn validate(config: &CrawlerConfig) -> Result<()> {
     schema::validate(&serde_json::to_value(config)?)?;
 
-    if config.queue.queues.discovery == config.queue.queues.articles {
+    let queue_names = [
+        config.queue.queues.discovery.as_str(),
+        config.queue.queues.articles.as_str(),
+        config.queue.queues.delivery.as_str(),
+    ];
+    if queue_names[0] == queue_names[1]
+        || queue_names[0] == queue_names[2]
+        || queue_names[1] == queue_names[2]
+    {
         return Err(CrawlError::Configuration(
-            "discovery and article queue names must be distinct".into(),
+            "discovery, article, and delivery queue names must be distinct".into(),
         ));
     }
     if config.ingestion.endpoint.is_some() && config.ingestion.token.trim().is_empty() {

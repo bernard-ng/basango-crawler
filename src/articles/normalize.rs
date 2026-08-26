@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    domain::{Article, ArticleDraft},
+    domain::{Article, ArticleDraft, ArticleHash},
     error::{CrawlError, Result},
 };
 
@@ -19,7 +19,7 @@ pub fn normalize(draft: ArticleDraft) -> Result<Article> {
     }
     // The URL hash is an identity value, not a security boundary. It lets
     // SQLite enforce idempotency when a URL is crawled more than once.
-    let hash = format!("{:x}", md5::compute(draft.link.as_str()));
+    let hash = ArticleHash::from_url(&draft.link);
 
     let mut seen = HashSet::new();
     let categories = draft

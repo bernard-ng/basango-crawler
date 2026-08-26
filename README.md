@@ -48,7 +48,7 @@ sudo -u basango ./crawler schedule --source-id 7sur7.cd
 sudo -u basango ./crawler schedule --source-id 7sur7.cd --category sport --direction backward
 ```
 
-The worker consumes the queued jobs. Systemd is not used for scheduling.
+The worker runs discovery, article parsing, and API delivery concurrently. Articles are persisted to SQLite before a delivery job is queued, so a restart can safely resume unfinished delivery. Systemd is not used for scheduling.
 
 ### Direct crawl
 
@@ -69,7 +69,7 @@ cd /opt/crawler
 sudo -u basango ./crawler status
 ```
 
-Retry pending article deliveries:
+Manually retry pending article deliveries (normally the delivery queue handles these):
 
 ```bash
 cd /opt/crawler

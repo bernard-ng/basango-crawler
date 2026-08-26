@@ -3,6 +3,7 @@
     "prefix": "basango:crawler",
     "queues": {
       "articles": "articles",
+      "delivery": "delivery",
       "discovery": "discovery"
     },
     "redis_url": "redis://localhost:6379/0",

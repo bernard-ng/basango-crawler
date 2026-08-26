@@ -38,7 +38,7 @@ enum Command {
     Crawl(CrawlArgs),
     /// Place one or more source discovery jobs in BullMQ.
     Schedule(ScheduleArgs),
-    /// Process BullMQ discovery and article jobs until interrupted.
+    /// Process BullMQ discovery, article, and delivery jobs until interrupted.
     Worker(WorkerArgs),
     /// Deliver pending or failed articles from the SQLite outbox.
     #[command(alias = "push")]
@@ -92,7 +92,7 @@ struct ScheduleArgs {
 
 #[derive(Debug, Args)]
 struct WorkerArgs {
-    /// Queue suffix to process; repeat to select both explicitly.
+    /// Queue suffix to process; repeat to select stages explicitly.
     #[arg(long, short = 'q')]
     queue: Vec<String>,
     /// Maximum number of jobs processed concurrently.
@@ -179,6 +179,10 @@ fn print_status(status: &CrawlerStatus) {
                 outbox.total, outbox.pending, outbox.forwarded, outbox.failed, outbox.claimed
             );
             println!("  Retryable failures: {}", outbox.retryable_failed);
+            println!(
+                "  Delivery intents: {} pending | {} failed",
+                outbox.delivery_intents_pending, outbox.delivery_intents_failed
+            );
         }
         Err(error) => println!("  State:  unavailable ({error})"),
     }
@@ -218,6 +222,10 @@ fn print_status(status: &CrawlerStatus) {
                 println!(
                     "      discovered {} | processed {} | persisted {} | delivered {} | failed {}",
                     run.discovered, run.processed, run.persisted, run.delivered, run.failed
+                );
+                println!(
+                    "      delivery jobs {} expected | {} processed",
+                    run.deliveries_expected, run.deliveries_processed
                 );
             }
         }

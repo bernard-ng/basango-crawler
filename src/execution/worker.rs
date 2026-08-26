@@ -1,5 +1,8 @@
 //! BullMQ worker orchestration.
 
+mod delivery;
+mod discovery;
+
 use std::sync::Arc;
 
 use bullmq::worker::WorkerEvent;
@@ -9,12 +12,15 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration, interval};
 
 use crate::{
-    articles::{ArticleIngestionClient, IngestStatus, Outbox, ingest},
+    articles::{ArticleIngestionClient, DeliveryIntent, DeliveryStatus, Outbox, normalize},
     error::{CrawlError, Result},
-    execution::{DiscoverJob, FetchJob, JobQueue, Runtime},
+    execution::{DeliveryJob, DiscoverJob, FetchJob, JobQueue, Runtime},
     sources::SourceAdapter,
-    telemetry::{AgentReporter, RunMetrics, RunReporter},
+    telemetry::{AgentReporter, RunReporter},
 };
+
+use delivery::{enqueue_delivery_intent, process_delivery, reconcile_delivery_intents};
+use discovery::process_discovery;
 
 pub async fn run_worker(
     runtime: Runtime,
@@ -31,6 +37,7 @@ pub async fn run_worker(
 
     let outbox = Outbox::open(&runtime.config.sqlite_path(), true)?;
     let ingestion = ArticleIngestionClient::new(&runtime.config.ingestion, runtime.http.clone())?;
+    reconcile_delivery_intents(&jobs, &outbox).await?;
     let permits = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut workers = Vec::with_capacity(queue_names.len());
 
@@ -77,6 +84,19 @@ pub async fn run_worker(
             heartbeat_reporter.heartbeat().await;
         }
     });
+    let reconciliation_jobs = jobs.clone();
+    let reconciliation_outbox = outbox.clone();
+    let reconciliation_task = tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(30));
+        loop {
+            ticker.tick().await;
+            if let Err(error) =
+                reconcile_delivery_intents(&reconciliation_jobs, &reconciliation_outbox).await
+            {
+                tracing::warn!(%error, "could not reconcile pending delivery intents");
+            }
+        }
+    });
 
     tracing::info!(
         agent_id = runtime.agent_id,
@@ -87,6 +107,7 @@ pub async fn run_worker(
     );
     tokio::signal::ctrl_c().await.map_err(CrawlError::Io)?;
     heartbeat_task.abort();
+    reconciliation_task.abort();
     tracing::info!("shutdown requested; draining BullMQ workers");
     let mut close_error = None;
     for worker in &workers {
@@ -182,7 +203,7 @@ async fn process_job(
                 );
                 return Ok(Value::Null);
             }
-            match process_article(runtime, outbox, ingestion, &payload).await {
+            match process_article(runtime, jobs, outbox, &payload).await {
                 Ok(outcome) => {
                     report_article_result(runtime, jobs, &payload, &job_id, outcome).await?;
                     Ok(Value::Null)
@@ -205,112 +226,40 @@ async fn process_job(
                 }
             }
         }
+        "deliver-article" => {
+            let job_id = job.id().to_owned();
+            let final_attempt = job.attempts_made() + 1 >= job.opts().attempts.unwrap_or(1);
+            let payload: DeliveryJob = serde_json::from_value(job.data().clone())?;
+            process_delivery(
+                runtime,
+                jobs,
+                outbox,
+                ingestion,
+                &payload,
+                &job_id,
+                final_attempt,
+            )
+            .await?;
+            Ok(Value::Null)
+        }
         name => Err(bullmq::Error::Unrecoverable(format!(
             "unknown crawler job '{name}'"
         ))),
     }
 }
 
-async fn process_discovery(
-    runtime: &Runtime,
-    jobs: &JobQueue,
-    payload: DiscoverJob,
-    final_attempt: bool,
-) -> Result<usize> {
-    let mut request = payload.request;
-    runtime.config.prepare_request(&mut request)?;
-    let reporter = queued_run_reporter(runtime, &payload.run, &request.source_id);
-    reporter.started().await;
-    let result: Result<usize> = async {
-        runtime.resolve_date_range(&mut request).await;
-        let source = runtime.config.source(&request.source_id)?;
-        let adapter = SourceAdapter::new(source, runtime.http.clone());
-        let mut batches = adapter.stream_discovery(request.clone());
-        let mut count = 0usize;
-        while let Some(batch) = batches.recv().await {
-            let batch = batch?;
-            if !jobs.run_is_open(&payload.run.run_id).await? {
-                tracing::info!(
-                    run_id = payload.run.run_id,
-                    source = %request.source_id,
-                    "queued run was completed during discovery; stopping"
-                );
-                return Ok(count);
-            }
-            let batch_count = batch.articles.len();
-            let Some(metrics) = jobs
-                .record_discovery_batch(&payload.run.run_id, &batch.id, batch_count)
-                .await?
-            else {
-                return Ok(count);
-            };
-            count = metrics.articles_discovered;
-            reporter.progress(metrics).await;
-            for article in batch.articles {
-                jobs.enqueue_article(FetchJob {
-                    request: request.clone(),
-                    article,
-                    run: payload.run.clone(),
-                })
-                .await?;
-            }
-        }
-
-        if let Some(update) = jobs.finish_discovery(&payload.run.run_id).await?
-            && update.terminal
-        {
-            reporter
-                .completed(update.metrics, queued_duration_ms(payload.run.started_at))
-                .await;
-        }
-        tracing::info!(source = %request.source_id, count, "discovery job queued articles");
-        Ok(count)
-    }
-    .await;
-
-    if let Err(error) = &result {
-        if final_attempt {
-            let metrics = match jobs.fail_run(&payload.run.run_id).await {
-                Ok(Some(metrics)) => metrics,
-                Ok(None) => RunMetrics::default(),
-                Err(tracking_error) => {
-                    tracing::warn!(
-                        run_id = payload.run.run_id,
-                        %tracking_error,
-                        "could not close queued run progress tracker"
-                    );
-                    RunMetrics::default()
-                }
-            };
-            reporter
-                .failed(
-                    metrics,
-                    queued_duration_ms(payload.run.started_at),
-                    error.to_string(),
-                )
-                .await;
-        } else {
-            tracing::warn!(
-                run_id = payload.run.run_id,
-                %error,
-                "discovery job attempt failed; BullMQ will retry it"
-            );
-        }
-    }
-    result
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct ArticleRunOutcome {
     persisted: usize,
     delivered: usize,
+    delivery_expected: usize,
     failed: usize,
 }
 
 async fn process_article(
     runtime: &Runtime,
+    jobs: &JobQueue,
     outbox: &Outbox,
-    ingestion: Option<&ArticleIngestionClient>,
     payload: &FetchJob,
 ) -> Result<ArticleRunOutcome> {
     let source = runtime.config.source(&payload.request.source_id)?;
@@ -328,23 +277,41 @@ async fn process_article(
         }
         Err(error) => return Err(error),
     };
-    let (_, status) = ingest(draft, outbox, ingestion).await?;
+    let article = normalize(draft)?;
+    let intent = DeliveryIntent {
+        run_id: payload.run.run_id.clone(),
+        agent_id: payload.run.agent_id.clone(),
+        source_id: payload.request.source_id.clone(),
+        article_hash: article.hash.clone(),
+        started_at: payload.run.started_at,
+    };
+    let status = outbox.save_with_delivery_intent(&article, &intent)?;
     tracing::info!(url = %payload.article.url, ?status, "article job completed");
     Ok(match status {
-        IngestStatus::Persisted => ArticleRunOutcome {
-            persisted: 1,
-            ..ArticleRunOutcome::default()
-        },
-        IngestStatus::AlreadyForwarded | IngestStatus::Forwarded => ArticleRunOutcome {
-            persisted: 1,
-            delivered: 1,
-            failed: 0,
-        },
-        IngestStatus::DeliveryFailed => ArticleRunOutcome {
-            persisted: 1,
-            delivered: 0,
-            failed: 1,
-        },
+        DeliveryStatus::Forwarded => {
+            if outbox.has_delivery_intent(&payload.run.run_id, article.hash.as_str())? {
+                ArticleRunOutcome {
+                    persisted: 1,
+                    delivery_expected: 1,
+                    ..ArticleRunOutcome::default()
+                }
+            } else {
+                ArticleRunOutcome {
+                    persisted: 1,
+                    delivered: 1,
+                    failed: 0,
+                    delivery_expected: 0,
+                }
+            }
+        }
+        DeliveryStatus::Pending | DeliveryStatus::Failed => {
+            enqueue_delivery_intent(jobs, outbox, &intent).await?;
+            ArticleRunOutcome {
+                persisted: 1,
+                delivery_expected: 1,
+                ..ArticleRunOutcome::default()
+            }
+        }
     })
 }
 
@@ -356,11 +323,12 @@ async fn report_article_result(
     outcome: ArticleRunOutcome,
 ) -> bullmq::Result<()> {
     let update = jobs
-        .record_run_result(
+        .record_article_result(
             &payload.run.run_id,
             job_id,
             outcome.persisted,
             outcome.delivered,
+            outcome.delivery_expected,
             outcome.failed,
         )
         .await
@@ -378,7 +346,7 @@ async fn report_article_result(
     Ok(())
 }
 
-fn queued_run_reporter(
+pub(super) fn queued_run_reporter(
     runtime: &Runtime,
     run: &super::queue::QueuedRunContext,
     source_id: &crate::domain::SourceId,
@@ -392,13 +360,13 @@ fn queued_run_reporter(
     )
 }
 
-fn queued_duration_ms(started_at: chrono::DateTime<chrono::Utc>) -> u64 {
+pub(super) fn queued_duration_ms(started_at: chrono::DateTime<chrono::Utc>) -> u64 {
     chrono::Utc::now()
         .signed_duration_since(started_at)
         .num_milliseconds()
         .max(0) as u64
 }
 
-fn processing_error(error: CrawlError) -> bullmq::Error {
+pub(super) fn processing_error(error: CrawlError) -> bullmq::Error {
     bullmq::Error::ProcessingError(error.to_string())
 }

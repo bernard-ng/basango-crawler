@@ -6,7 +6,7 @@ use super::*;
 
 fn article() -> Article {
     Article {
-        hash: "hash-1".into(),
+        hash: crate::domain::ArticleHash::new("11111111111111111111111111111111").unwrap(),
         title: "Title".into(),
         body: "Body".into(),
         link: Url::parse("https://example.com/one").unwrap(),
@@ -27,6 +27,64 @@ fn forwarded_rows_stay_forwarded_when_saved_again() {
     assert_eq!(outbox.save(&article).unwrap(), DeliveryStatus::Pending);
     outbox.mark_forwarded(&article.hash).unwrap();
     assert_eq!(outbox.save(&article).unwrap(), DeliveryStatus::Forwarded);
+}
+
+#[test]
+fn delivery_intent_is_persisted_with_the_article_and_completed() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("outbox.db");
+    let outbox = Outbox::open(&path, true).unwrap();
+    let article = article();
+    let intent = DeliveryIntent {
+        run_id: "019c0000-0000-7000-8000-000000000001".into(),
+        agent_id: "pi-01".into(),
+        source_id: article.source_id.clone(),
+        article_hash: article.hash.clone(),
+        started_at: Utc::now(),
+    };
+
+    assert_eq!(
+        outbox.save_with_delivery_intent(&article, &intent).unwrap(),
+        DeliveryStatus::Pending
+    );
+    let pending = outbox.pending_delivery_intents(10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].run_id, intent.run_id);
+    assert_eq!(pending[0].article_hash, article.hash);
+
+    outbox
+        .mark_delivery_intent_queued(&intent.run_id, article.hash.as_str())
+        .unwrap();
+    assert_eq!(outbox.pending_delivery_intents(10).unwrap().len(), 1);
+    assert_eq!(outbox.stats().unwrap().delivery_intents_pending, 1);
+
+    outbox
+        .complete_delivery_intent(&intent.run_id, article.hash.as_str(), true)
+        .unwrap();
+    assert_eq!(outbox.stats().unwrap().delivery_intents_pending, 0);
+}
+
+#[test]
+fn clearing_articles_cascades_to_delivery_intents() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("outbox.db");
+    let outbox = Outbox::open(&path, true).unwrap();
+    let article = article();
+    outbox
+        .save_with_delivery_intent(
+            &article,
+            &DeliveryIntent {
+                run_id: "019c0000-0000-7000-8000-000000000002".into(),
+                agent_id: "pi-01".into(),
+                source_id: article.source_id.clone(),
+                article_hash: article.hash.clone(),
+                started_at: Utc::now(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(outbox.clear().unwrap(), 1);
+    assert_eq!(outbox.stats().unwrap().delivery_intents_pending, 0);
 }
 
 #[test]
@@ -127,13 +185,13 @@ fn stats_summarize_delivery_and_claim_state() {
         .unwrap();
 
     let mut second = article();
-    second.hash = "hash-2".into();
+    second.hash = crate::domain::ArticleHash::new("22222222222222222222222222222222").unwrap();
     second.link = Url::parse("https://example.com/two").unwrap();
     outbox.save(&second).unwrap();
     outbox.mark_failed(&second.hash, "temporary", true).unwrap();
 
     let mut third = article();
-    third.hash = "hash-3".into();
+    third.hash = crate::domain::ArticleHash::new("33333333333333333333333333333333").unwrap();
     third.link = Url::parse("https://example.com/three").unwrap();
     outbox.save(&third).unwrap();
     outbox.mark_forwarded(&third.hash).unwrap();
@@ -147,6 +205,8 @@ fn stats_summarize_delivery_and_claim_state() {
             failed: 1,
             retryable_failed: 1,
             claimed: 1,
+            delivery_intents_pending: 0,
+            delivery_intents_failed: 0,
         }
     );
 }

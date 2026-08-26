@@ -73,6 +73,7 @@ fn queue_names_schema() -> ObjectSchema {
     object()
         .optional_field("discovery", non_blank_string())
         .optional_field("articles", non_blank_string())
+        .optional_field("delivery", non_blank_string())
         .strict()
 }
 

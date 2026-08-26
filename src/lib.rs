@@ -20,7 +20,8 @@ pub use crawler::{
     AgentResetReport, Crawler, CrawlerStatus, OpenRunStatus, QueueStatus, RedisStatus,
 };
 pub use domain::{
-    Article, ArticleDraft, ArticleMetadata, CrawlRequest, DateRange, PageRange, SourceId,
+    AgentId, Article, ArticleDraft, ArticleHash, ArticleMetadata, CategorySlug, CrawlRequest,
+    DateRange, DeliveryOutcome, DeliveryState, PageRange, RetryDecision, RunId, SourceId,
     UpdateDirection,
 };
 pub use error::{CrawlError, Result};

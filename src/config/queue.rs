@@ -25,6 +25,7 @@ impl Default for QueueConfig {
 pub struct QueueNames {
     pub discovery: String,
     pub articles: String,
+    pub delivery: String,
 }
 
 impl Default for QueueNames {
@@ -32,6 +33,7 @@ impl Default for QueueNames {
         Self {
             discovery: "discovery".into(),
             articles: "articles".into(),
+            delivery: "delivery".into(),
         }
     }
 }

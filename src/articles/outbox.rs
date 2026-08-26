@@ -4,67 +4,25 @@
 //! is held across `.await`. Clones share one connection inside a process; WAL
 //! mode still allows other crawler processes to coexist safely.
 
+mod intents;
+mod model;
+mod persistence;
+
 use std::{
     path::Path,
-    str::FromStr,
     sync::{Arc, Mutex, MutexGuard},
 };
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{
-    Connection, OptionalExtension, TransactionBehavior, named_params, params, types::Type,
-};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 
 use crate::{
     domain::Article,
     error::{CrawlError, Result},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryStatus {
-    Pending,
-    Forwarded,
-    Failed,
-}
-
-impl FromStr for DeliveryStatus {
-    type Err = CrawlError;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "pending" => Ok(Self::Pending),
-            "forwarded" => Ok(Self::Forwarded),
-            "failed" => Ok(Self::Failed),
-            other => Err(CrawlError::Configuration(format!(
-                "unknown outbox status '{other}'"
-            ))),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct OutboxEntry {
-    pub article: Article,
-    pub status: DeliveryStatus,
-    pub attempts: u32,
-    pub retryable: bool,
-    pub last_error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub forwarded_at: Option<DateTime<Utc>>,
-    pub claimed_at: Option<DateTime<Utc>>,
-    pub claimed_by: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct OutboxStats {
-    pub total: usize,
-    pub pending: usize,
-    pub forwarded: usize,
-    pub failed: usize,
-    pub retryable_failed: usize,
-    pub claimed: usize,
-}
+pub use model::{DeliveryIntent, DeliveryStatus, OutboxEntry, OutboxStats};
+use persistence::save_article;
 
 #[derive(Clone)]
 pub struct Outbox {
@@ -113,7 +71,9 @@ impl Outbox {
                     COALESCE(SUM(status = 'forwarded'), 0),
                     COALESCE(SUM(status = 'failed'), 0),
                     COALESCE(SUM(status = 'failed' AND retryable = 1), 0),
-                    COALESCE(SUM(claimed_at IS NOT NULL), 0)
+                    COALESCE(SUM(claimed_at IS NOT NULL), 0),
+                    (SELECT COALESCE(SUM(status = 'pending'), 0) FROM delivery_intents),
+                    (SELECT COALESCE(SUM(status = 'failed'), 0) FROM delivery_intents)
                 FROM articles"#,
                 [],
                 |row| {
@@ -124,6 +84,8 @@ impl Outbox {
                         failed: row.get(3)?,
                         retryable_failed: row.get(4)?,
                         claimed: row.get(5)?,
+                        delivery_intents_pending: row.get(6)?,
+                        delivery_intents_failed: row.get(7)?,
                     })
                 },
             )
@@ -133,64 +95,8 @@ impl Outbox {
     /// Upsert by hash while preserving an already-forwarded state. This is the
     /// idempotency boundary: crawling the same URL twice does not redeliver it.
     pub fn save(&self, article: &Article) -> Result<DeliveryStatus> {
-        let timestamp = Utc::now().to_rfc3339();
-        let categories = serde_json::to_string(&article.categories)?;
-        let metadata = article
-            .metadata
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let payload = serde_json::to_string(article)?;
-
         let connection = self.connection()?;
-        connection.execute(
-            r#"
-            INSERT INTO articles (
-                hash, source_id, link, title, body, categories, metadata,
-                published_at, payload, status, attempts, retryable,
-                last_error, created_at, updated_at, forwarded_at
-            )
-            VALUES (
-                :hash, :source_id, :link, :title, :body, :categories, :metadata,
-                :published_at, :payload, 'pending', 0, 1, NULL, :now, :now, NULL
-            )
-            ON CONFLICT(hash) DO UPDATE SET
-                source_id = excluded.source_id,
-                link = excluded.link,
-                title = excluded.title,
-                body = excluded.body,
-                categories = excluded.categories,
-                metadata = excluded.metadata,
-                published_at = excluded.published_at,
-                payload = excluded.payload,
-                status = CASE WHEN articles.status = 'forwarded' THEN 'forwarded' ELSE 'pending' END,
-                last_error = CASE WHEN articles.status = 'forwarded' THEN articles.last_error ELSE NULL END,
-                retryable = CASE WHEN articles.status = 'forwarded' THEN articles.retryable ELSE 1 END,
-                updated_at = excluded.updated_at,
-                forwarded_at = CASE WHEN articles.status = 'forwarded' THEN articles.forwarded_at ELSE NULL END,
-                claimed_at = NULL,
-                claimed_by = NULL
-            "#,
-            named_params! {
-                ":hash": article.hash,
-                ":source_id": article.source_id.as_str(),
-                ":link": article.link.as_str(),
-                ":title": article.title,
-                ":body": article.body,
-                ":categories": categories,
-                ":metadata": metadata,
-                ":published_at": article.published_at.to_rfc3339(),
-                ":payload": payload,
-                ":now": timestamp,
-            },
-        )?;
-
-        let status: String = connection.query_row(
-            "SELECT status FROM articles WHERE hash = ?1",
-            [&article.hash],
-            |row| row.get(0),
-        )?;
-        status.parse()
+        save_article(&connection, article)
     }
 
     pub fn list_pending(&self, source_id: Option<&str>, limit: usize) -> Result<Vec<OutboxEntry>> {
@@ -369,6 +275,23 @@ impl Outbox {
                 ON articles(source_id, status);
             CREATE INDEX IF NOT EXISTS articles_claimed_at_created_at_idx
                 ON articles(claimed_at, created_at);
+
+            CREATE TABLE IF NOT EXISTS delivery_intents (
+                run_id TEXT NOT NULL,
+                article_hash TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'completed', 'failed')),
+                created_at TEXT NOT NULL,
+                queued_at TEXT,
+                completed_at TEXT,
+                PRIMARY KEY (run_id, article_hash),
+                FOREIGN KEY (article_hash) REFERENCES articles(hash) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS delivery_intents_pending_idx
+                ON delivery_intents(status, queued_at, created_at);
             "#,
         )?;
         Ok(())

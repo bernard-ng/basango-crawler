@@ -25,6 +25,10 @@ pub(super) fn apply(config: &mut CrawlerConfig) -> Result<()> {
         "BASANGO_CRAWLER_QUEUE_ARTICLES",
         &mut config.queue.queues.articles,
     );
+    set_string(
+        "BASANGO_CRAWLER_QUEUE_DELIVERY",
+        &mut config.queue.queues.delivery,
+    );
     set_parsed(
         "BASANGO_CRAWLER_RETAIN_COMPLETED",
         &mut config.queue.retention.completed,

@@ -21,6 +21,7 @@ pub struct AgentResetReport {
     pub agent_id: String,
     pub discovery_queue: String,
     pub articles_queue: String,
+    pub delivery_queue: String,
     pub progress_trackers_removed: usize,
     pub outbox_articles_removed: usize,
 }
@@ -46,6 +47,8 @@ pub struct OpenRunStatus {
     pub started_at: DateTime<Utc>,
     pub discovered: usize,
     pub processed: usize,
+    pub deliveries_expected: usize,
+    pub deliveries_processed: usize,
     pub persisted: usize,
     pub delivered: usize,
     pub failed: usize,
@@ -180,7 +183,9 @@ impl Crawler {
                         source_id: run.source_id.to_string(),
                         started_at: run.run.started_at,
                         discovered: run.metrics.articles_discovered,
-                        processed: run.processed,
+                        processed: run.articles_processed,
+                        deliveries_expected: run.deliveries_expected,
+                        deliveries_processed: run.deliveries_processed,
                         persisted: run.metrics.articles_persisted,
                         delivered: run.metrics.articles_delivered,
                         failed: run.metrics.articles_failed,
@@ -206,6 +211,7 @@ impl Crawler {
             agent_id,
             discovery_queue,
             articles_queue,
+            delivery_queue,
             progress_trackers_removed,
         } = queue.reset_agent().await?;
         let outbox = Outbox::open(&self.runtime.config.sqlite_path(), true)?;
@@ -221,6 +227,7 @@ impl Crawler {
             agent_id,
             discovery_queue,
             articles_queue,
+            delivery_queue,
             progress_trackers_removed,
             outbox_articles_removed,
         })

@@ -1,196 +1,14 @@
-//! BullMQ-backed jobs used by `schedule` and `worker`.
-//!
-//! BullMQ owns queue state transitions, retry backoff, job locks, lock renewal,
-//! stalled-job recovery, and retention. This module only defines Basango's
-//! typed payloads and translates crawler configuration into BullMQ options.
-
-use std::time::Duration;
-
-use bullmq::options::RedisConnectionOptions;
-use bullmq::types::{BackoffStrategy, JobCounts, KeepJobs, RemoveOnFinish};
-use bullmq::{Queue, QueueOptions};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 
-use crate::{
-    config::QueueConfig,
-    domain::{CrawlRequest, SourceId},
-    error::{CrawlError, Result},
-    sources::ArticleSeed,
-    telemetry::RunMetrics,
+use crate::{domain::SourceId, error::Result, telemetry::RunMetrics};
+
+use super::{
+    AgentResetReport, JobQueue, OpenQueuedRun, QueueSnapshot, QueuedRunContext, QueuedRunUpdate,
+    RUN_PROGRESS_TTL_SECONDS,
+    support::{metrics_from_values, parse_metric, queue_snapshot, queued_update_from_values},
 };
 
-const JOB_ATTEMPTS: u32 = 3;
-const RETRY_DELAY_MS: u64 = 1_000;
-const RUN_PROGRESS_TTL_SECONDS: usize = 7 * 24 * 60 * 60;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QueuedRunContext {
-    pub run_id: String,
-    pub agent_id: String,
-    pub started_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoverJob {
-    pub request: CrawlRequest,
-    pub run: QueuedRunContext,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FetchJob {
-    pub request: CrawlRequest,
-    pub article: ArticleSeed,
-    pub run: QueuedRunContext,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct QueuedRunUpdate {
-    pub metrics: RunMetrics,
-    pub terminal: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct OpenQueuedRun {
-    pub run: QueuedRunContext,
-    pub source_id: SourceId,
-    pub processed: usize,
-    pub metrics: RunMetrics,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentResetReport {
-    pub agent_id: String,
-    pub discovery_queue: String,
-    pub articles_queue: String,
-    pub progress_trackers_removed: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueueSnapshot {
-    pub name: String,
-    pub workers: usize,
-    pub waiting: u64,
-    pub active: u64,
-    pub delayed: u64,
-    pub prioritized: u64,
-    pub completed: u64,
-    pub failed: u64,
-    pub waiting_children: u64,
-    pub paused: u64,
-}
-
-/// Producer-side access to the two crawler queues.
-pub struct JobQueue {
-    discovery: Queue,
-    articles: Queue,
-    config: QueueConfig,
-    agent_id: String,
-    agent_scope: String,
-    discovery_name: String,
-    articles_name: String,
-    progress_client: redis::Client,
-}
-
 impl JobQueue {
-    pub async fn connect(config: &QueueConfig, agent_id: &str) -> Result<Self> {
-        let options = queue_options(config);
-        let progress_client = redis::Client::open(config.redis_url.clone())?;
-        let agent_scope = encode_agent_id(agent_id);
-        let discovery_name = scoped_queue_name(&agent_scope, &config.queues.discovery);
-        let articles_name = scoped_queue_name(&agent_scope, &config.queues.articles);
-        let (discovery, articles) = tokio::try_join!(
-            Queue::with_options(&discovery_name, options.clone()),
-            Queue::with_options(&articles_name, options),
-        )?;
-        Ok(Self {
-            discovery,
-            articles,
-            config: config.clone(),
-            agent_id: agent_id.to_owned(),
-            agent_scope,
-            discovery_name,
-            articles_name,
-            progress_client,
-        })
-    }
-
-    pub fn names(&self) -> [&str; 2] {
-        [self.discovery_name.as_str(), self.articles_name.as_str()]
-    }
-
-    pub fn validate_names(&self, names: &[String]) -> Result<()> {
-        let scoped = self.names();
-        let base = [
-            self.config.queues.discovery.as_str(),
-            self.config.queues.articles.as_str(),
-        ];
-        for name in names {
-            if !scoped.contains(&name.as_str()) && !base.contains(&name.as_str()) {
-                return Err(CrawlError::Queue(format!(
-                    "unknown queue '{name}'; expected {} or {}",
-                    base[0], base[1]
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn resolve_names(&self, names: &[String]) -> Vec<String> {
-        names
-            .iter()
-            .map(|name| {
-                if name == &self.config.queues.discovery {
-                    self.discovery_name.clone()
-                } else if name == &self.config.queues.articles {
-                    self.articles_name.clone()
-                } else {
-                    name.clone()
-                }
-            })
-            .collect()
-    }
-
-    pub async fn enqueue_discovery(&self, job: DiscoverJob) -> Result<String> {
-        let id = stable_job_id("discover", &job)?;
-        let run_id = job.run.run_id.clone();
-        let source_id = job.request.source_id.clone();
-        let queued = self
-            .discovery
-            .add("discover-source", job)
-            .job_id(&id)
-            .attempts(JOB_ATTEMPTS)
-            .backoff(BackoffStrategy::Exponential(RETRY_DELAY_MS))
-            .remove_on_complete(retention(self.config.retention.completed))
-            .remove_on_fail(retention(self.config.retention.failed))
-            .await?;
-        tracing::info!(
-            agent_id = self.agent_id,
-            queue = self.discovery_name,
-            job_id = queued.id(),
-            %run_id,
-            source = %source_id,
-            "discovery job enqueued"
-        );
-        Ok(queued.id().to_owned())
-    }
-
-    pub async fn enqueue_article(&self, job: FetchJob) -> Result<String> {
-        let identity = (&job.run.run_id, &job.request.source_id, &job.article.url);
-        let id = stable_job_id("article", &identity)?;
-        let queued = self
-            .articles
-            .add("fetch-article", job)
-            .job_id(&id)
-            .attempts(JOB_ATTEMPTS)
-            .backoff(BackoffStrategy::Exponential(RETRY_DELAY_MS))
-            .remove_on_complete(retention(self.config.retention.completed))
-            .remove_on_fail(retention(self.config.retention.failed))
-            .await?;
-        Ok(queued.id().to_owned())
-    }
-
     pub async fn prepare_run(&self, run: &QueuedRunContext, source_id: &SourceId) -> Result<()> {
         const SCRIPT: &str = r#"
             if redis.call('EXISTS', KEYS[1]) == 0 then
@@ -199,7 +17,9 @@ impl JobQueue {
                     'startedAt', ARGV[2],
                     'discovered', 0,
                     'discoveryComplete', 0,
-                    'processed', 0,
+                    'articleProcessed', 0,
+                    'deliveryExpected', 0,
+                    'deliveryProcessed', 0,
                     'persisted', 0,
                     'delivered', 0,
                     'failed', 0,
@@ -227,15 +47,22 @@ impl JobQueue {
         &self,
         run_id: &str,
         batch_id: &str,
-        discovered: usize,
+        article_job_ids: &[String],
     ) -> Result<Option<RunMetrics>> {
         const SCRIPT: &str = r#"
             if redis.call('EXISTS', KEYS[1]) == 0 then return {} end
             if tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 1 then return {} end
-            if redis.call('HSETNX', KEYS[1], 'batch:' .. ARGV[1], 1) == 1 then
-                redis.call('HINCRBY', KEYS[1], 'discovered', ARGV[2])
+            redis.call('HSET', KEYS[1], 'batch:' .. ARGV[1], 1)
+            local added = 0
+            for index = 3, #ARGV do
+                if redis.call('HSETNX', KEYS[1], 'article:' .. ARGV[index], 1) == 1 then
+                    added = added + 1
+                end
             end
-            redis.call('EXPIRE', KEYS[1], ARGV[3])
+            if added > 0 then
+                redis.call('HINCRBY', KEYS[1], 'discovered', added)
+            end
+            redis.call('EXPIRE', KEYS[1], ARGV[2])
             return {
                 tonumber(redis.call('HGET', KEYS[1], 'discovered')) or 0,
                 tonumber(redis.call('HGET', KEYS[1], 'persisted')) or 0,
@@ -251,8 +78,8 @@ impl JobQueue {
         let values: Vec<i64> = redis::Script::new(SCRIPT)
             .key(key)
             .arg(batch_id)
-            .arg(discovered)
             .arg(RUN_PROGRESS_TTL_SECONDS)
+            .arg(article_job_ids)
             .invoke_async(&mut connection)
             .await?;
         if values.is_empty() {
@@ -268,9 +95,11 @@ impl JobQueue {
             if tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 1 then return {} end
             redis.call('HSET', KEYS[1], 'discoveryComplete', 1)
             local discovered = tonumber(redis.call('HGET', KEYS[1], 'discovered')) or 0
-            local processed = tonumber(redis.call('HGET', KEYS[1], 'processed')) or 0
+            local articleProcessed = tonumber(redis.call('HGET', KEYS[1], 'articleProcessed')) or 0
+            local deliveryExpected = tonumber(redis.call('HGET', KEYS[1], 'deliveryExpected')) or 0
+            local deliveryProcessed = tonumber(redis.call('HGET', KEYS[1], 'deliveryProcessed')) or 0
             local terminal = 0
-            if processed >= discovered then
+            if articleProcessed >= discovered and deliveryProcessed >= deliveryExpected then
                 redis.call('HSET', KEYS[1], 'terminalSent', 1)
                 terminal = 1
             end
@@ -314,31 +143,35 @@ impl JobQueue {
         Ok(open == 1)
     }
 
-    pub async fn record_run_result(
+    pub async fn record_article_result(
         &self,
         run_id: &str,
         job_id: &str,
         persisted: usize,
         delivered: usize,
+        delivery_expected: usize,
         failed: usize,
     ) -> Result<Option<QueuedRunUpdate>> {
         const SCRIPT: &str = r#"
             if redis.call('EXISTS', KEYS[1]) == 0 then return {} end
             if tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 1 then return {} end
             if redis.call('HSETNX', KEYS[1], 'job:' .. ARGV[1], 1) == 0 then return {} end
-            local processed = redis.call('HINCRBY', KEYS[1], 'processed', 1)
+            local articleProcessed = redis.call('HINCRBY', KEYS[1], 'articleProcessed', 1)
             local persisted = redis.call('HINCRBY', KEYS[1], 'persisted', ARGV[2])
             local delivered = redis.call('HINCRBY', KEYS[1], 'delivered', ARGV[3])
-            local failed = redis.call('HINCRBY', KEYS[1], 'failed', ARGV[4])
+            local deliveryExpected = redis.call('HINCRBY', KEYS[1], 'deliveryExpected', ARGV[4])
+            local failed = redis.call('HINCRBY', KEYS[1], 'failed', ARGV[5])
             local discovered = tonumber(redis.call('HGET', KEYS[1], 'discovered')) or 0
+            local deliveryProcessed = tonumber(redis.call('HGET', KEYS[1], 'deliveryProcessed')) or 0
             local terminal = 0
             if tonumber(redis.call('HGET', KEYS[1], 'discoveryComplete')) == 1
-                and processed >= discovered
+                and articleProcessed >= discovered
+                and deliveryProcessed >= deliveryExpected
                 and tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 0 then
                 redis.call('HSET', KEYS[1], 'terminalSent', 1)
                 terminal = 1
             end
-            redis.call('EXPIRE', KEYS[1], ARGV[5])
+            redis.call('EXPIRE', KEYS[1], ARGV[6])
             return {discovered, persisted, delivered, failed, terminal}
         "#;
         let key = self.run_progress_key(run_id);
@@ -351,6 +184,7 @@ impl JobQueue {
             .arg(job_id)
             .arg(persisted)
             .arg(delivered)
+            .arg(delivery_expected)
             .arg(failed)
             .arg(RUN_PROGRESS_TTL_SECONDS)
             .invoke_async(&mut connection)
@@ -358,18 +192,34 @@ impl JobQueue {
         queued_update_from_values(&values)
     }
 
-    pub async fn fail_run(&self, run_id: &str) -> Result<Option<RunMetrics>> {
+    pub async fn record_delivery_result(
+        &self,
+        run_id: &str,
+        job_id: &str,
+        delivered: usize,
+        failed: usize,
+    ) -> Result<Option<QueuedRunUpdate>> {
         const SCRIPT: &str = r#"
             if redis.call('EXISTS', KEYS[1]) == 0 then return {} end
             if tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 1 then return {} end
-            redis.call('HSET', KEYS[1], 'terminalSent', 1)
-            redis.call('EXPIRE', KEYS[1], ARGV[1])
-            return {
-                tonumber(redis.call('HGET', KEYS[1], 'discovered')) or 0,
-                tonumber(redis.call('HGET', KEYS[1], 'persisted')) or 0,
-                tonumber(redis.call('HGET', KEYS[1], 'delivered')) or 0,
-                tonumber(redis.call('HGET', KEYS[1], 'failed')) or 0
-            }
+            if redis.call('HSETNX', KEYS[1], 'deliveryJob:' .. ARGV[1], 1) == 0 then return {} end
+            local deliveryProcessed = redis.call('HINCRBY', KEYS[1], 'deliveryProcessed', 1)
+            local delivered = redis.call('HINCRBY', KEYS[1], 'delivered', ARGV[2])
+            local failed = redis.call('HINCRBY', KEYS[1], 'failed', ARGV[3])
+            local discovered = tonumber(redis.call('HGET', KEYS[1], 'discovered')) or 0
+            local articleProcessed = tonumber(redis.call('HGET', KEYS[1], 'articleProcessed')) or 0
+            local deliveryExpected = tonumber(redis.call('HGET', KEYS[1], 'deliveryExpected')) or 0
+            local terminal = 0
+            if tonumber(redis.call('HGET', KEYS[1], 'discoveryComplete')) == 1
+                and articleProcessed >= discovered
+                and deliveryProcessed >= deliveryExpected
+                and tonumber(redis.call('HGET', KEYS[1], 'terminalSent')) == 0 then
+                redis.call('HSET', KEYS[1], 'terminalSent', 1)
+                terminal = 1
+            end
+            redis.call('EXPIRE', KEYS[1], ARGV[4])
+            return {discovered, tonumber(redis.call('HGET', KEYS[1], 'persisted')) or 0,
+                delivered, failed, terminal}
         "#;
         let key = self.run_progress_key(run_id);
         let mut connection = self
@@ -378,27 +228,27 @@ impl JobQueue {
             .await?;
         let values: Vec<i64> = redis::Script::new(SCRIPT)
             .key(key)
+            .arg(job_id)
+            .arg(delivered)
+            .arg(failed)
             .arg(RUN_PROGRESS_TTL_SECONDS)
             .invoke_async(&mut connection)
             .await?;
-        if values.len() != 4 {
-            return Ok(None);
-        }
-        Ok(Some(RunMetrics {
-            articles_discovered: values[0].max(0) as usize,
-            articles_persisted: values[1].max(0) as usize,
-            articles_delivered: values[2].max(0) as usize,
-            articles_failed: values[3].max(0) as usize,
-        }))
+        queued_update_from_values(&values)
+    }
+
+    pub async fn fail_run(&self, run_id: &str) -> Result<Option<RunMetrics>> {
+        self.close_run(run_id).await
     }
 
     pub async fn status(&self) -> Result<(Vec<QueueSnapshot>, Vec<OpenQueuedRun>)> {
-        let (discovery, articles, runs) = tokio::try_join!(
+        let (discovery, articles, delivery, runs) = tokio::try_join!(
             queue_snapshot(&self.discovery, &self.discovery_name),
             queue_snapshot(&self.articles, &self.articles_name),
+            queue_snapshot(&self.delivery, &self.delivery_name),
             self.open_runs(),
         )?;
-        Ok((vec![discovery, articles], runs))
+        Ok((vec![discovery, articles, delivery], runs))
     }
 
     pub async fn open_runs(&self) -> Result<Vec<OpenQueuedRun>> {
@@ -425,7 +275,9 @@ impl JobQueue {
                         "sourceId",
                         "startedAt",
                         "discovered",
-                        "processed",
+                        "articleProcessed",
+                        "deliveryExpected",
+                        "deliveryProcessed",
                         "persisted",
                         "delivered",
                         "failed",
@@ -433,7 +285,7 @@ impl JobQueue {
                     ])
                     .query_async(&mut connection)
                     .await?;
-                if values.len() != 8 || values[7].as_deref() == Some("1") {
+                if values.len() != 10 || values[9].as_deref() == Some("1") {
                     continue;
                 }
                 let Some(run_id) = key.rsplit(':').next() else {
@@ -454,9 +306,9 @@ impl JobQueue {
                 };
                 let metrics = [
                     parse_metric(values[2].as_deref().unwrap_or("0")),
-                    parse_metric(values[4].as_deref().unwrap_or("0")),
-                    parse_metric(values[5].as_deref().unwrap_or("0")),
                     parse_metric(values[6].as_deref().unwrap_or("0")),
+                    parse_metric(values[7].as_deref().unwrap_or("0")),
+                    parse_metric(values[8].as_deref().unwrap_or("0")),
                 ];
                 let [Ok(discovered), Ok(persisted), Ok(delivered), Ok(failed)] = metrics else {
                     tracing::warn!(run_id, "skipping queued run tracker with invalid metrics");
@@ -469,7 +321,9 @@ impl JobQueue {
                         started_at: started_at.with_timezone(&Utc),
                     },
                     source_id,
-                    processed: parse_metric(values[3].as_deref().unwrap_or("0"))?,
+                    articles_processed: parse_metric(values[3].as_deref().unwrap_or("0"))?,
+                    deliveries_expected: parse_metric(values[4].as_deref().unwrap_or("0"))?,
+                    deliveries_processed: parse_metric(values[5].as_deref().unwrap_or("0"))?,
                     metrics: RunMetrics {
                         articles_discovered: discovered,
                         articles_persisted: persisted,
@@ -500,6 +354,7 @@ impl JobQueue {
     pub async fn reset_agent(&self) -> Result<AgentResetReport> {
         self.discovery.obliterate(true, 1_000).await?;
         self.articles.obliterate(true, 1_000).await?;
+        self.delivery.obliterate(true, 1_000).await?;
 
         let pattern = self.run_progress_pattern();
         let mut connection = self
@@ -534,6 +389,7 @@ impl JobQueue {
             agent_id: self.agent_id.clone(),
             discovery_queue: self.discovery_name.clone(),
             articles_queue: self.articles_name.clone(),
+            delivery_queue: self.delivery_name.clone(),
             progress_trackers_removed,
         })
     }
@@ -586,117 +442,3 @@ impl JobQueue {
         }))
     }
 }
-
-pub fn queue_options(config: &QueueConfig) -> QueueOptions {
-    QueueOptions::new()
-        .connection(redis_options(config))
-        .prefix(config.prefix.clone())
-}
-
-pub fn redis_options(config: &QueueConfig) -> RedisConnectionOptions {
-    RedisConnectionOptions {
-        url: config.redis_url.clone(),
-        ..RedisConnectionOptions::default()
-    }
-}
-
-async fn queue_snapshot(queue: &Queue, name: &str) -> Result<QueueSnapshot> {
-    let (counts, workers) = tokio::try_join!(queue.get_job_counts(), queue.get_workers_count())?;
-    Ok(snapshot_from_counts(name, workers, counts))
-}
-
-fn snapshot_from_counts(name: &str, workers: usize, counts: JobCounts) -> QueueSnapshot {
-    QueueSnapshot {
-        name: name.to_owned(),
-        workers,
-        waiting: counts.waiting,
-        active: counts.active,
-        delayed: counts.delayed,
-        prioritized: counts.prioritized,
-        completed: counts.completed,
-        failed: counts.failed,
-        waiting_children: counts.waiting_children,
-        paused: counts.paused,
-    }
-}
-
-fn retention(seconds: u64) -> RemoveOnFinish {
-    if seconds == 0 {
-        RemoveOnFinish::Bool(true)
-    } else {
-        RemoveOnFinish::Options(KeepJobs {
-            age: Some(Duration::from_secs(seconds).as_millis() as u64),
-            count: None,
-            limit: Some(1_000),
-        })
-    }
-}
-
-fn stable_job_id(prefix: &str, value: &impl Serialize) -> Result<String> {
-    let bytes = serde_json::to_vec(value)?;
-    Ok(format!("{prefix}-{:x}", md5::compute(bytes)))
-}
-
-fn encode_agent_id(agent_id: &str) -> String {
-    let mut encoded = String::with_capacity(agent_id.len());
-    for byte in agent_id.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('_');
-            encoded.push_str(&format!("{byte:02x}"));
-        }
-    }
-    if encoded.is_empty() {
-        "agent".to_owned()
-    } else {
-        encoded
-    }
-}
-
-fn scoped_queue_name(agent_scope: &str, queue_name: &str) -> String {
-    format!("{agent_scope}-{queue_name}")
-}
-
-fn parse_metric(value: &str) -> Result<usize> {
-    value.parse::<usize>().map_err(|_| {
-        CrawlError::Queue(format!(
-            "invalid queued run metric '{value}' in Redis progress tracker"
-        ))
-    })
-}
-
-fn metrics_from_values(values: &[i64]) -> Result<RunMetrics> {
-    if values.len() != 4 {
-        return Err(CrawlError::Queue(format!(
-            "expected 4 queued run metrics, received {}",
-            values.len()
-        )));
-    }
-    Ok(RunMetrics {
-        articles_discovered: values[0].max(0) as usize,
-        articles_persisted: values[1].max(0) as usize,
-        articles_delivered: values[2].max(0) as usize,
-        articles_failed: values[3].max(0) as usize,
-    })
-}
-
-fn queued_update_from_values(values: &[i64]) -> Result<Option<QueuedRunUpdate>> {
-    if values.is_empty() {
-        return Ok(None);
-    }
-    if values.len() != 5 {
-        return Err(CrawlError::Queue(format!(
-            "expected 5 queued run update values, received {}",
-            values.len()
-        )));
-    }
-    Ok(Some(QueuedRunUpdate {
-        metrics: metrics_from_values(&values[..4])?,
-        terminal: values[4] == 1,
-    }))
-}
-
-#[cfg(test)]
-#[path = "../../tests/unit/execution/queue.rs"]
-mod tests;

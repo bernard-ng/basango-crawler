@@ -5,6 +5,7 @@ fn bundled_configuration_matches_the_zod_and_rust_schemas() {
     let config = loader::parse(loader::BUNDLED_CONFIG).unwrap();
     assert_eq!(config.queue.queues.discovery, "discovery");
     assert_eq!(config.queue.queues.articles, "articles");
+    assert_eq!(config.queue.queues.delivery, "delivery");
     assert!(matches!(config.sources[0], SourceConfig::Html(_)));
 }
 
