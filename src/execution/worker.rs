@@ -16,7 +16,7 @@ use crate::{
     error::{CrawlError, Result},
     execution::{DeliveryJob, DiscoverJob, FetchJob, JobQueue, QueuedArticleResult, Runtime},
     sources::SourceAdapter,
-    telemetry::{AgentReporter, RunReporter},
+    telemetry::{AgentReporter, HEARTBEAT_INTERVAL, RunReporter},
 };
 
 use delivery::{enqueue_delivery_intent, process_delivery, reconcile_delivery_intents};
@@ -86,7 +86,7 @@ pub async fn run_worker(
         &runtime.agent_id,
     );
     let heartbeat_task = tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(15));
+        let mut ticker = interval(HEARTBEAT_INTERVAL);
         loop {
             ticker.tick().await;
             heartbeat_reporter.heartbeat().await;

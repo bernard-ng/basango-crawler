@@ -4,10 +4,7 @@ use std::time::Duration as StdDuration;
 use std::time::Instant;
 
 use chrono::Duration;
-use tokio::{
-    sync::oneshot,
-    time::{Duration as TokioDuration, interval},
-};
+use tokio::{sync::oneshot, time::interval};
 use uuid::Uuid;
 
 use crate::{
@@ -16,7 +13,7 @@ use crate::{
     error::{CrawlError, Result},
     execution::Runtime,
     sources::SourceAdapter,
-    telemetry::{RunMetrics, RunReporter},
+    telemetry::{HEARTBEAT_INTERVAL, RunMetrics, RunReporter},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -38,7 +35,7 @@ pub async fn crawl_now(runtime: &Runtime, mut request: CrawlRequest) -> Result<C
     );
     let heartbeat_reporter = reporter.clone();
     let heartbeat_task = tokio::spawn(async move {
-        let mut ticker = interval(TokioDuration::from_secs(15));
+        let mut ticker = interval(HEARTBEAT_INTERVAL);
         loop {
             ticker.tick().await;
             heartbeat_reporter.heartbeat().await;
