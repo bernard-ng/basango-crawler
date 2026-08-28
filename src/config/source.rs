@@ -89,6 +89,13 @@ impl SourceConfig {
         &self.common().url
     }
 
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Html(_) => "html",
+            Self::WordPress(_) => "wordpress",
+        }
+    }
+
     pub fn common(&self) -> &CommonSourceConfig {
         match self {
             Self::Html(source) => &source.common,

@@ -95,4 +95,11 @@ impl SourceAdapter {
             Self::WordPress(crawler) => crawler.collect(seed, request).await,
         }
     }
+
+    pub async fn estimate_total_articles(&self) -> Result<usize> {
+        match self {
+            Self::Html(crawler) => crawler.estimate_total_articles().await,
+            Self::WordPress(crawler) => crawler.estimate_total_articles().await,
+        }
+    }
 }

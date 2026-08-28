@@ -30,6 +30,27 @@ impl HtmlCrawler {
         Self { source, http }
     }
 
+    pub async fn estimate_total_articles(&self) -> Result<usize> {
+        let mut estimate = 0usize;
+
+        if self.source.indexed_categories.is_empty() {
+            return self.estimate_category(None).await;
+        }
+
+        for category in &self.source.indexed_categories {
+            estimate = estimate
+                .checked_add(self.estimate_category(Some(category)).await?)
+                .ok_or_else(|| {
+                    CrawlError::Configuration(format!(
+                        "archive estimate overflowed for source '{}'",
+                        self.source.common.id
+                    ))
+                })?;
+        }
+
+        Ok(estimate)
+    }
+
     /// Crawl listings and detail pages directly in one process.
     pub async fn crawl_into(
         &self,
@@ -271,6 +292,37 @@ impl HtmlCrawler {
         let Ok(html) = self.fetch_text(&url).await else {
             return Ok(fallback);
         };
+
+        self.pagination_from_html(&html)
+    }
+
+    async fn estimate_category(&self, category: Option<&str>) -> Result<usize> {
+        let url = self.endpoint_url(0, category)?;
+        let html = self.fetch_text(&url).await?;
+        let page_range = self.pagination_from_html(&html)?;
+        let articles_per_page = self.listing_entries(&html)?.len();
+        if articles_per_page == 0 {
+            return Err(CrawlError::InvalidSourceSelectors(format!(
+                "selector '{}' matched no archive articles for source '{}'",
+                self.source.selectors.list, self.source.common.id
+            )));
+        }
+        let estimate = estimate_archive_size(articles_per_page, page_range)?;
+
+        tracing::info!(
+            source = %self.source.common.id,
+            category = category.unwrap_or("<none>"),
+            articles_per_page,
+            pages = %page_range,
+            estimate,
+            "estimated HTML archive size"
+        );
+
+        Ok(estimate)
+    }
+
+    fn pagination_from_html(&self, html: &str) -> Result<PageRange> {
+        let fallback = PageRange::new(0, 0)?;
         let document = Html::parse_document(&html);
         let selector = parse_selector(&self.source.selectors.pagination)?;
         let Some(href) = document
@@ -395,6 +447,17 @@ impl HtmlCrawler {
         }
         self.http.get(url).await?.require_success()?.text()
     }
+}
+
+fn estimate_archive_size(articles_per_page: usize, page_range: PageRange) -> Result<usize> {
+    let page_count = u64::from(page_range.end) - u64::from(page_range.start) + 1;
+    let page_count = usize::try_from(page_count).map_err(|_| {
+        CrawlError::Configuration("HTML archive page count does not fit this platform".into())
+    })?;
+
+    articles_per_page
+        .checked_mul(page_count)
+        .ok_or_else(|| CrawlError::Configuration("HTML archive article estimate overflowed".into()))
 }
 
 #[cfg(test)]

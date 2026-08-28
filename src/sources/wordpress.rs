@@ -75,6 +75,12 @@ impl WordPressCrawler {
         }
     }
 
+    pub async fn estimate_total_articles(&self) -> Result<usize> {
+        let (_, articles) = self.archive_summary().await?;
+
+        Ok(articles)
+    }
+
     pub async fn crawl_into(
         &mut self,
         request: &CrawlRequest,
@@ -237,20 +243,31 @@ impl WordPressCrawler {
     }
 
     async fn pagination(&self) -> Result<PageRange> {
+        let (page_range, _) = self.archive_summary().await?;
+
+        Ok(page_range)
+    }
+
+    async fn archive_summary(&self) -> Result<(PageRange, usize)> {
         let mut url = self.api_url("wp-json/wp/v2/posts")?;
         url.query_pairs_mut()
             .append_pair("_fields", "id")
             .append_pair("per_page", "100");
-        let response = self.fetch(&url).await?;
+        let response = self.fetch(&url).await?.require_success()?;
         let pages = header_number(&response.headers, "x-wp-totalpages").unwrap_or(1);
-        let posts = header_number(&response.headers, "x-wp-total").unwrap_or(0);
+        let page_range = PageRange::new(1, pages.max(1))?;
+        let posts = match header_number(&response.headers, "x-wp-total") {
+            Some(total) => total as usize,
+            None => response.json::<Vec<serde_json::Value>>()?.len() * pages.max(1) as usize,
+        };
         tracing::info!(
             pages,
             posts,
             source = %self.source.common.id,
             "WordPress pagination"
         );
-        PageRange::new(1, pages.max(1))
+
+        Ok((page_range, posts))
     }
 
     fn page_url(&self, page: u32) -> Result<Url> {

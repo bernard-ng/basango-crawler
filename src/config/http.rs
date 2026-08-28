@@ -30,7 +30,7 @@ impl Default for HttpClientConfig {
             respect_retry_after: true,
             rotate: true,
             timeout: 20,
-            user_agent: "Basango/0.1 (+https://github.com/bernard-ng/basango)".into(),
+            user_agent: "Basango/0.2 (+https://github.com/bernard-ng/basango)".into(),
             verify_ssl: true,
         }
     }

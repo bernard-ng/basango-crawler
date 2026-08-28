@@ -75,3 +75,34 @@ fn substitutes_category_and_page_in_endpoint() {
         "https://example.com/category/news/page/3"
     );
 }
+
+#[test]
+fn estimates_html_archives_from_first_page_density_and_page_count() {
+    let crawler = HtmlCrawler::new(source(), HttpClient::new(&Default::default()).unwrap());
+    let html = r#"
+        <div class="article"></div>
+        <div class="article"></div>
+        <div class="article"></div>
+        <nav class="pages"><a href="/news?page=4">Last</a></nav>
+    "#;
+
+    let page_range = crawler.pagination_from_html(html).unwrap();
+    let articles_per_page = crawler.listing_entries(html).unwrap().len();
+
+    assert_eq!(page_range, PageRange::new(0, 4).unwrap());
+    assert_eq!(
+        estimate_archive_size(articles_per_page, page_range).unwrap(),
+        15
+    );
+}
+
+#[test]
+fn estimates_a_listing_without_pagination_as_one_page() {
+    let crawler = HtmlCrawler::new(source(), HttpClient::new(&Default::default()).unwrap());
+    let html = r#"<div class="article"></div><div class="article"></div>"#;
+
+    let page_range = crawler.pagination_from_html(html).unwrap();
+
+    assert_eq!(page_range, PageRange::new(0, 0).unwrap());
+    assert_eq!(estimate_archive_size(2, page_range).unwrap(), 2);
+}

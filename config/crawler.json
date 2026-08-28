@@ -21,7 +21,7 @@
     "max_retries": 3,
     "rotate": true,
     "timeout": 20,
-    "user_agent": "Basango/0.1 (+https://basango.ngandu.dev)"
+    "user_agent": "Basango/0.2 (+https://basango.ngandu.dev)"
   },
   "runtime": {
     "direction": "forward",
