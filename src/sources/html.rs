@@ -323,7 +323,7 @@ impl HtmlCrawler {
 
     fn pagination_from_html(&self, html: &str) -> Result<PageRange> {
         let fallback = PageRange::new(0, 0)?;
-        let document = Html::parse_document(&html);
+        let document = Html::parse_document(html);
         let selector = parse_selector(&self.source.selectors.pagination)?;
         let Some(href) = document
             .select(&selector)
