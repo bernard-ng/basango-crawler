@@ -29,6 +29,15 @@ The installer asks for the agent ID, API connection, and Redis URL. It installs 
 
 Configuration is stored in `/opt/crawler/.env`. Every machine must have a unique `BASANGO_CRAWLER_AGENT_ID`.
 
+To completely uninstall an agent, including its configuration and local SQLite data:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bernard-ng/basango-crawler/refs/heads/main/deploy/uninstall.sh \
+  | sudo bash
+```
+
+The uninstaller asks for confirmation before removing the worker service, crawler files, local state, and installer-created system account. Pass `--yes` when running it unattended.
+
 ### Worker
 
 ```bash
