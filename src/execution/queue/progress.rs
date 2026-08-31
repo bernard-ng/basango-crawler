@@ -4,8 +4,7 @@ use crate::{domain::SourceId, error::Result, telemetry::RunMetrics};
 
 use super::{
     AgentResetReport, JobQueue, OpenQueuedRun, PROGRESS_PUBLISH_INTERVAL_MS, QueueSnapshot,
-    QueuedArticleResult, QueuedRunContext, QueuedRunReconciliation, QueuedRunUpdate,
-    RUN_PROGRESS_TTL_SECONDS,
+    QueuedArticleResult, QueuedRunContext, QueuedRunUpdate, RUN_PROGRESS_TTL_SECONDS,
     support::{metrics_from_values, parse_metric, queue_snapshot, queued_update_from_values},
 };
 
@@ -389,62 +388,6 @@ impl JobQueue {
         Ok(runs)
     }
 
-    pub async fn reconcile_run(&self, run_id: &str) -> Result<QueuedRunReconciliation> {
-        let key = self.run_progress_key(run_id);
-        let mut connection = self
-            .progress_client
-            .get_multiplexed_async_connection()
-            .await?;
-        let exists: bool = redis::cmd("EXISTS")
-            .arg(&key)
-            .query_async(&mut connection)
-            .await?;
-        if !exists {
-            return Err(crate::error::CrawlError::Queue(format!(
-                "run tracker '{run_id}' was not found or has expired"
-            )));
-        }
-
-        let values: Vec<Option<String>> = redis::cmd("HMGET")
-            .arg(&key)
-            .arg(&[
-                "sourceId",
-                "discoveryComplete",
-                "terminalSent",
-                "discovered",
-                "articleProcessed",
-                "processed",
-                "persisted",
-                "skipped",
-                "failed",
-                "deliveryExpected",
-                "deliveryProcessed",
-                "delivered",
-            ])
-            .query_async(&mut connection)
-            .await?;
-        if values.len() != 12 {
-            return Err(crate::error::CrawlError::Queue(format!(
-                "run tracker '{run_id}' returned an invalid reconciliation record"
-            )));
-        }
-
-        Ok(QueuedRunReconciliation {
-            run_id: run_id.to_owned(),
-            source_id: values[0].clone(),
-            discovery_complete: parse_optional_flag(values[1].as_deref())?,
-            terminal: parse_optional_flag(values[2].as_deref())?.unwrap_or(false),
-            discovered: parse_metric(values[3].as_deref().unwrap_or("0"))?,
-            processed: parse_optional_metric(values[4].as_deref().or(values[5].as_deref()))?,
-            persisted: parse_metric(values[6].as_deref().unwrap_or("0"))?,
-            skipped: parse_optional_metric(values[7].as_deref())?,
-            failed: parse_metric(values[8].as_deref().unwrap_or("0"))?,
-            deliveries_expected: parse_optional_metric(values[9].as_deref())?,
-            deliveries_processed: parse_optional_metric(values[10].as_deref())?,
-            delivered: parse_metric(values[11].as_deref().unwrap_or("0"))?,
-        })
-    }
-
     pub async fn reset_agent(&self) -> Result<AgentResetReport> {
         self.discovery.obliterate(true, 1_000).await?;
         self.articles.obliterate(true, 1_000).await?;
@@ -532,22 +475,5 @@ impl JobQueue {
             return Ok(None);
         }
         Ok(Some(metrics_from_values(&values)?))
-    }
-}
-
-fn parse_optional_metric(value: Option<&str>) -> Result<Option<usize>> {
-    value.map(parse_metric).transpose()
-}
-
-fn parse_optional_flag(value: Option<&str>) -> Result<Option<bool>> {
-    let Some(value) = parse_optional_metric(value)? else {
-        return Ok(None);
-    };
-    match value {
-        0 => Ok(Some(false)),
-        1 => Ok(Some(true)),
-        value => Err(crate::error::CrawlError::Queue(format!(
-            "invalid queued run flag '{value}' in Redis progress tracker"
-        ))),
     }
 }

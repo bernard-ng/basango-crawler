@@ -61,22 +61,6 @@ pub struct OpenQueuedRun {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueuedRunReconciliation {
-    pub run_id: String,
-    pub source_id: Option<String>,
-    pub discovery_complete: Option<bool>,
-    pub terminal: bool,
-    pub discovered: usize,
-    pub processed: Option<usize>,
-    pub persisted: usize,
-    pub skipped: Option<usize>,
-    pub failed: usize,
-    pub deliveries_expected: Option<usize>,
-    pub deliveries_processed: Option<usize>,
-    pub delivered: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentResetReport {
     pub agent_id: String,
     pub discovery_queue: String,

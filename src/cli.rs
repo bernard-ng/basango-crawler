@@ -4,14 +4,14 @@
 //! typed ranges and options, so deeper modules do not repeatedly validate the
 //! same input.
 
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    Crawler, CrawlerStatus, RunReconciliation,
+    Crawler, CrawlerStatus,
     domain::{CrawlRequest, DateRange, PageRange, SourceId, UpdateDirection},
     error::CrawlError,
 };
@@ -33,24 +33,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Crawl one source immediately in this process.
-    #[command(alias = "sync")]
     Crawl(CrawlArgs),
-    /// Place one or more source discovery jobs in BullMQ.
     Schedule(ScheduleArgs),
-    /// Process BullMQ discovery, article, and delivery jobs until interrupted.
     Worker(WorkerArgs),
-    /// Deliver pending or failed articles from the SQLite outbox.
-    #[command(alias = "push")]
     Deliver(DeliverArgs),
-    /// Show this agent's Redis queues, open runs, and SQLite outbox state.
     Status,
-    /// Audit one Redis run tracker without changing queue state.
-    ReconcileRun(ReconcileRunArgs),
-    /// Clear this agent's queues, run trackers, and SQLite outbox.
-    #[command(alias = "reset")]
-    ResetAgent,
-    /// Print version information (also available as --version).
+    Reset,
     Version,
 }
 
@@ -76,7 +64,7 @@ struct CrawlArgs {
 #[derive(Debug, Args)]
 struct ScheduleArgs {
     /// Repeat the flag or pass comma-separated IDs.
-    #[arg(long = "source-id", value_delimiter = ',')]
+    #[arg(long = "source-id", value_delimiter = ',', required = true)]
     source_ids: Vec<SourceId>,
     /// Inclusive page range in start:end form, for example 1:5.
     #[arg(long, value_parser = parse_page_range)]
@@ -113,13 +101,6 @@ struct DeliverArgs {
     /// Retry failures previously classified as non-retryable (for example after fixing a payload).
     #[arg(long)]
     retry_all: bool,
-}
-
-#[derive(Debug, Args)]
-struct ReconcileRunArgs {
-    /// Run identifier shown by the ingestion dashboard or crawler status.
-    #[arg(long)]
-    run_id: String,
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -165,11 +146,7 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         Command::Status => print_status(&crawler.status().await),
-        Command::ReconcileRun(arguments) => {
-            let reconciliation = crawler.reconcile_run(&arguments.run_id).await?;
-            print_run_reconciliation(&reconciliation);
-        }
-        Command::ResetAgent => {
+        Command::Reset => {
             let report = crawler.reset_agent().await?;
             tracing::info!(?report, "agent state reset");
         }
@@ -251,99 +228,8 @@ fn print_status(status: &CrawlerStatus) {
     }
 }
 
-fn print_run_reconciliation(run: &RunReconciliation) {
-    println!("Run reconciliation");
-    println!("  Run:       {}", run.run_id);
-    println!(
-        "  Source:    {}",
-        run.source_id.as_deref().unwrap_or("<unknown>")
-    );
-    println!(
-        "  State:     {}",
-        if run.terminal { "terminal" } else { "open" }
-    );
-    println!(
-        "  Discovery: {}",
-        match run.discovery_complete {
-            Some(true) => "complete",
-            Some(false) => "running",
-            None => "unknown (legacy tracker)",
-        }
-    );
-    println!("  Discovered: {}", run.discovered);
-    println!("  Processed:  {}", optional_metric(run.processed));
-    println!("  Persisted:  {}", run.persisted);
-    println!("  Skipped:    {}", optional_metric(run.skipped));
-    println!("  Failed:     {}", run.failed);
-    println!("  Delivered:  {}", run.delivered);
-
-    let gap = run.discovered.saturating_sub(run.persisted);
-    println!();
-    println!("Accounting");
-    println!("  Discovery-to-persistence gap: {gap}");
-    match run.processed {
-        Some(processed) => {
-            let remaining = run.discovered.saturating_sub(processed);
-            println!("  Not processed:                {remaining}");
-            match run.skipped {
-                Some(skipped) => {
-                    let other_non_persisted = processed
-                        .saturating_sub(run.persisted)
-                        .saturating_sub(skipped);
-                    println!("  Explicitly skipped:           {skipped}");
-                    println!("  Other non-persisted results:  {other_non_persisted}");
-                }
-                None => {
-                    println!(
-                        "  Processed but not persisted:  {}",
-                        processed.saturating_sub(run.persisted)
-                    );
-                    println!("  Explicit skip count:          unknown (legacy tracker)");
-                }
-            }
-            if run.terminal && remaining > 0 {
-                println!();
-                println!(
-                    "  INCONSISTENT: this run is terminal but {remaining} discovered article(s) were never processed"
-                );
-            }
-        }
-        None => {
-            println!(
-                "  Legacy tracker: processed fields are unavailable, so the gap cannot be split exactly"
-            );
-        }
-    }
-
-    println!();
-    println!("Delivery jobs");
-    println!("  Expected:  {}", optional_metric(run.deliveries_expected));
-    println!("  Processed: {}", optional_metric(run.deliveries_processed));
-}
-
-fn optional_metric(value: Option<usize>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown (legacy tracker)".to_owned())
-}
-
 async fn schedule(crawler: &Crawler, arguments: ScheduleArgs) -> anyhow::Result<()> {
-    let source_ids = if arguments.source_ids.is_empty() {
-        env::var("BASANGO_CRAWLER_SOURCE_IDS")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::parse)
-            .collect::<Result<Vec<SourceId>, _>>()?
-    } else {
-        arguments.source_ids
-    };
-    if source_ids.is_empty() {
-        bail!("pass --source-id or set BASANGO_CRAWLER_SOURCE_IDS");
-    }
-
-    for source_id in source_ids {
+    for source_id in arguments.source_ids {
         let id = crawler
             .schedule(CrawlRequest {
                 source_id: source_id.clone(),

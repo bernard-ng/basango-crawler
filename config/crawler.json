@@ -127,9 +127,55 @@
       "url": "https://newscd.net"
     },
     {
-      "kind": "wordpress",
+      "kind": "html",
       "id": "africanewsrdc.net",
-      "url": "https://www.africanewsrdc.net"
+      "url": "https://www.africanewsrdc.net",
+      "date_format": "yyyy-LL-dd'T'HH:mm:ssxx",
+      "fetch_details": true,
+      "indexed_categories": [
+        "actu",
+        "afrique",
+        "android",
+        "breves",
+        "communication",
+        "covid19",
+        "culture",
+        "editions",
+        "edito",
+        "education",
+        "environnement",
+        "factcheck",
+        "featured",
+        "featured-2",
+        "hitech",
+        "health",
+        "interview",
+        "justice",
+        "medias",
+        "nation",
+        "non-classe",
+        "politique",
+        "portrait",
+        "presidentielle",
+        "security",
+        "societe",
+        "sondage",
+        "sport",
+        "spec-elect",
+        "world",
+        "ecofin",
+        "tribune"
+      ],
+      "pagination_template": "rubriques/{category}/page/{page}/",
+      "selectors": {
+        "body": ".entry-content.entry",
+        "categories": ".post-cat-wrap a",
+        "date": "head > meta[property=\"article:published_time\"]",
+        "link": "h2.post-title a",
+        "list": "#posts-container > li.post-item",
+        "title": "h1.post-title.entry-title",
+        "pagination": ".pages-nav a"
+      }
     },
     {
       "kind": "wordpress",
@@ -192,19 +238,35 @@
       "url": "https://habarirdc.net"
     },
     {
-      "kind": "wordpress",
+      "kind": "html",
       "id": "infordc.com",
-      "url": "https://infordc.com"
+      "url": "https://infordc.com",
+      "date_format": "yyyy-LL-dd'T'HH:mm:ssxx",
+      "fetch_details": true,
+      "indexed_categories": [
+        "actualites",
+        "politique",
+        "securite",
+        "societe",
+        "culture",
+        "environnement",
+        "economie"
+      ],
+      "pagination_template": "category/{category}/page/{page}/",
+      "selectors": {
+        "body": ".entry-content .content-inner",
+        "categories": ".entry-header .jeg_meta_category a",
+        "date": "head > meta[property=\"article:published_time\"]",
+        "link": ".jeg_post_title a",
+        "list": ".jnews_category_content_wrapper .jeg_posts > article.jeg_post",
+        "title": ".entry-header h1.jeg_post_title",
+        "pagination": ".jeg_navigation a.page_number"
+      }
     },
     {
       "kind": "wordpress",
       "id": "kilalopress.net",
       "url": "https://kilalopress.net"
-    },
-    {
-      "kind": "wordpress",
-      "id": "laprosperiteonline.net",
-      "url": "https://laprosperiteonline.net"
     },
     {
       "kind": "wordpress",
@@ -225,11 +287,6 @@
       "kind": "wordpress",
       "id": "netic-news.net",
       "url": "https://www.netic-news.net"
-    },
-    {
-      "kind": "wordpress",
-      "id": "objectif-infos.cd",
-      "url": "https://objectif-infos.cd"
     },
     {
       "kind": "wordpress",

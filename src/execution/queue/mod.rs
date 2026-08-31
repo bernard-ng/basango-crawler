@@ -18,7 +18,7 @@ use crate::{
 
 pub use model::{
     AgentResetReport, DeliveryJob, DiscoverJob, FetchJob, OpenQueuedRun, QueueSnapshot,
-    QueuedArticleResult, QueuedRunContext, QueuedRunReconciliation, QueuedRunUpdate,
+    QueuedArticleResult, QueuedRunContext, QueuedRunUpdate,
 };
 pub(crate) use support::redis_options;
 use support::{encode_agent_id, queue_options, retention, scoped_queue_name, stable_job_id};

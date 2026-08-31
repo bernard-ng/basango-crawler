@@ -31,11 +31,6 @@ fn status_is_a_standalone_command() {
 }
 
 #[test]
-fn reconcile_run_requires_a_run_identifier() {
-    let cli = Cli::try_parse_from(["crawler", "reconcile-run", "--run-id", "run-1"]).unwrap();
-    let Command::ReconcileRun(arguments) = cli.command else {
-        panic!("expected reconcile-run command")
-    };
-
-    assert_eq!(arguments.run_id, "run-1");
+fn schedule_requires_an_explicit_source() {
+    assert!(Cli::try_parse_from(["crawler", "schedule"]).is_err());
 }
