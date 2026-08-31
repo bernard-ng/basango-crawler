@@ -99,13 +99,11 @@ impl Crawler {
 
     /// Crawl now, streaming collected drafts into the durable outbox.
     pub async fn crawl(&self, request: CrawlRequest) -> Result<CrawlReport> {
-        self.runtime.synchronize_sources().await?;
         crawl_now(&self.runtime, request).await
     }
 
     /// Schedule source discovery in BullMQ.
     pub async fn schedule(&self, mut request: CrawlRequest) -> Result<String> {
-        self.runtime.synchronize_sources().await?;
         self.runtime.config.prepare_request(&mut request)?;
         let reporter = RunReporter::new(
             &self.runtime.config.ingestion,
@@ -159,8 +157,12 @@ impl Crawler {
 
     /// Run BullMQ consumers until the process receives Ctrl-C.
     pub async fn work(&self, queues: Vec<String>, concurrency: usize) -> Result<()> {
-        self.runtime.synchronize_sources().await?;
         run_worker(self.runtime.clone(), queues, concurrency).await
+    }
+
+    /// Register configured sources and update their archive-size estimates.
+    pub async fn synchronize_sources(&self) -> Result<()> {
+        self.runtime.synchronize_sources().await
     }
 
     /// Read the current agent's local outbox and Redis queue state.

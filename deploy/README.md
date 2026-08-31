@@ -44,9 +44,11 @@ curl -fsSL https://raw.githubusercontent.com/bernard-ng/basango-crawler/refs/hea
 
 From a local checkout, run `sudo ./deploy/uninstall.sh`. The script stops and disables the worker, removes its systemd unit, `/opt/crawler`, `/var/lib/crawler`, and the installer-created `basango` system account and group. It asks for confirmation first; pass `--yes` for unattended removal.
 
-Pushing a `v*` Git tag runs the release workflow, which publishes native `aarch64` (Raspberry Pi) and `x86_64` Linux archives to the GitHub release.
+Pushing a release tag runs the release workflow, which publishes native `aarch64` (Raspberry Pi) and `x86_64` Linux archives to the GitHub release.
 
 Each agent ID prefixes its discovery, article, and delivery queue names, so multiple Pis can safely share Redis. The worker consumes all three concurrently and reconciles SQLite delivery records after a restart. The installer does not schedule crawls. Run `crawler schedule` yourself or configure cron later with the sources and cadence assigned to that device.
+
+After installation, register the configured sources and estimate their archive sizes once with `sudo -u basango /opt/crawler/crawler source`. Run it again only when the configured sources change; normal crawler and worker runs do not perform source synchronization.
 
 To reset a Pi, stop its worker before clearing its scoped queues and SQLite outbox:
 

@@ -31,6 +31,12 @@ fn status_is_a_standalone_command() {
 }
 
 #[test]
+fn source_is_a_standalone_command() {
+    let cli = Cli::try_parse_from(["crawler", "source"]).unwrap();
+    assert!(matches!(cli.command, Command::Source));
+}
+
+#[test]
 fn schedule_requires_an_explicit_source() {
     assert!(Cli::try_parse_from(["crawler", "schedule"]).is_err());
 }

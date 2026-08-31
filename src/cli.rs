@@ -33,6 +33,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Register configured sources and estimate their archive sizes.
+    Source,
     Crawl(CrawlArgs),
     Schedule(ScheduleArgs),
     Worker(WorkerArgs),
@@ -119,6 +121,10 @@ pub async fn run() -> anyhow::Result<()> {
     .context("could not initialize crawler")?;
 
     match cli.command {
+        Command::Source => {
+            crawler.synchronize_sources().await?;
+            tracing::info!("source synchronization and estimation completed");
+        }
         Command::Crawl(arguments) => {
             let report = crawler.crawl(arguments.into()).await?;
             tracing::info!(?report, "crawl completed");

@@ -47,6 +47,17 @@ sudo journalctl -fu basango-crawler-worker.service
 
 The worker starts automatically at boot. Stopping it gracefully drains active work and leaves incomplete runs open so the next worker process can resume them. Repeated Redis connection failures make the process exit, allowing systemd to restart it without closing the affected runs.
 
+### Synchronize sources
+
+Run source registration and archive-size estimation once after installation, or again whenever the configured source list changes:
+
+```bash
+cd /opt/crawler
+sudo -u basango ./crawler source
+```
+
+Normal `crawl`, `schedule`, and `worker` runs do not synchronize or estimate sources.
+
 ### Schedule crawls (Initial)
 
 Schedule every registered source that does not require an indexed category:

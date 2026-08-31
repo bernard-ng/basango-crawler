@@ -18,10 +18,6 @@ pub(crate) use worker::run_worker;
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
-use serde::Deserialize;
-use tokio::sync::OnceCell;
-
 use crate::{
     articles::endpoint_url,
     config::CrawlerConfig,
@@ -30,6 +26,8 @@ use crate::{
     http::HttpClient,
     telemetry::agent_id,
 };
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
 
 /// Shared, immutable dependencies are placed in `Arc` so queued jobs can own a
 /// cheap reference while running concurrently.
@@ -38,7 +36,6 @@ pub(crate) struct Runtime {
     pub config: Arc<CrawlerConfig>,
     pub http: HttpClient,
     pub agent_id: String,
-    source_sync: Arc<OnceCell<()>>,
 }
 
 impl Runtime {
@@ -50,15 +47,11 @@ impl Runtime {
             config: Arc::new(config),
             http,
             agent_id,
-            source_sync: Arc::new(OnceCell::new()),
         })
     }
 
     pub async fn synchronize_sources(&self) -> Result<()> {
-        self.source_sync
-            .get_or_try_init(|| async { source_sync::synchronize(self).await })
-            .await
-            .map(|_| ())
+        source_sync::synchronize(self).await
     }
 
     /// Ask the ingestion API for the last known article boundary when the caller did
