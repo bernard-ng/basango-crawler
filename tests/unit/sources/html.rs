@@ -106,3 +106,42 @@ fn estimates_a_listing_without_pagination_as_one_page() {
     assert_eq!(page_range, PageRange::new(0, 0).unwrap());
     assert_eq!(estimate_archive_size(2, page_range).unwrap(), 2);
 }
+
+#[test]
+fn actualite_category_selector_ignores_non_article_grid_columns() {
+    let config: crate::config::CrawlerConfig =
+        serde_json::from_str(include_str!("../../../config/crawler.json")).unwrap();
+    let source = config
+        .sources
+        .into_iter()
+        .find_map(|source| match source {
+            crate::config::SourceConfig::Html(source)
+                if source.common.id.as_str() == "actualite.cd" =>
+            {
+                Some(*source)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let crawler = HtmlCrawler::new(source, HttpClient::new(&Default::default()).unwrap());
+    let html = r#"
+        <div class="grid views-view-grid row">
+            <div class="col-12 col-lg-4"><div class="advertisement"></div></div>
+            <div class="col-12 col-lg-4">
+                <div class="post post-variant-3"><a class="post-link" href="/first">First</a></div>
+            </div>
+            <div class="col-12 col-lg-4">
+                <div class="post post-variant-3"><a class="post-link" href="/second">Second</a></div>
+            </div>
+        </div>
+    "#;
+
+    let entries = crawler.listing_entries(html).unwrap();
+
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| crawler.extract_link(entry).unwrap().is_some())
+    );
+}

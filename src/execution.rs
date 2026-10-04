@@ -78,7 +78,7 @@ impl Runtime {
             return;
         };
         let headers = [("Authorization", self.config.ingestion.token.as_str())];
-        let payload = serde_json::json!({ "name": request.source_id.as_str() });
+        let payload = publication_bounds_payload(request);
         let response = match self.http.post_json(&endpoint, &headers, &payload).await {
             Ok(response) if response.is_success() => response,
             Ok(response) => {
@@ -132,6 +132,22 @@ impl Runtime {
                 "invalid publication bounds; crawling without a date filter"
             ),
         }
+    }
+}
+
+fn publication_bounds_payload(request: &CrawlRequest) -> serde_json::Value {
+    let name = request.source_id.as_str();
+    let category = request
+        .category
+        .as_deref()
+        .and_then(|category| category.rsplit('/').next())
+        .map(str::trim)
+        .filter(|category| !category.is_empty())
+        .map(str::to_lowercase);
+
+    match category {
+        Some(category) => serde_json::json!({ "name": name, "category": category }),
+        None => serde_json::json!({ "name": name }),
     }
 }
 

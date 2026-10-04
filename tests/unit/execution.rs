@@ -3,6 +3,22 @@ use chrono::TimeZone;
 use super::*;
 
 #[test]
+fn categorized_publication_bounds_request_uses_the_category_leaf() {
+    let request = CrawlRequest {
+        source_id: crate::domain::SourceId::new("actualite.cd").unwrap(),
+        page_range: None,
+        date_range: None,
+        category: Some("actualite/santé".into()),
+        direction: None,
+    };
+
+    assert_eq!(
+        publication_bounds_payload(&request),
+        serde_json::json!({ "name": "actualite.cd", "category": "santé" })
+    );
+}
+
+#[test]
 fn empty_publication_bounds_do_not_filter_a_first_crawl() {
     let bounds = SourcePublicationBounds {
         earliest: None,

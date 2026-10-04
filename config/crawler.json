@@ -110,7 +110,7 @@
         "categories": "[id$=\"-categorie\"] a",
         "date": "head > meta[property=\"article:published_time\"]",
         "link": ".post-link",
-        "list": ".grid.views-view-grid.row > .col-12.col-lg-4",
+        "list": ".grid.views-view-grid.row .post.post-variant-3",
         "title": "[id$=\"-page-title\"] h1",
         "pagination": "nav.pager a"
       }
